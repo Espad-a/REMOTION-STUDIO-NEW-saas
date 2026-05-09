@@ -1,0 +1,59 @@
+{
+  "description": "",
+  "text": "Explainer Video",
+  "template": "hud",
+  "circleCount": 4,
+  "fontFamily": "Bebas Neue",
+  "hSpacing": 270,
+  "vSpacing": 80,
+  "customCircleSize": 350,
+  "cols": 2,
+  "rows": 2,
+  "elements": [
+    {
+      "id": "1",
+      "type": "image",
+      "url": "",
+      "x": 0,
+      "y": 0,
+      "size": 70
+    }
+  ],
+  "showBorder": true,
+  "topicCuts": {},
+  "topicNodes": [
+    {
+      "title": "Topic 1",
+      "mediaUrl": "placeholder.mp4",
+      "script": "",
+      "audioUrl": ""
+    },
+    {
+      "title": "Topic 2",
+      "mediaUrl": "placeholder.mp4",
+      "script": "",
+      "audioUrl": ""
+    },
+    {
+      "title": "Topic 3",
+      "mediaUrl": "placeholder.mp4",
+      "script": "",
+      "audioUrl": ""
+    },
+    {
+      "title": "Topic 4",
+      "mediaUrl": "placeholder.mp4",
+      "script": "",
+      "audioUrl": ""
+    }
+  ],
+  "hudEnabled": false,
+  "hudTitleColor": "#000000",
+  "hudProgressColor": "#949494",
+  "hudShowTitle": true,
+  "hudShowImage": true,
+  "hudShowProgress": true,
+  "hudTitleShadow": false,
+  "hudImageShadow": true,
+  "hudProgressBarShadow": true
+}

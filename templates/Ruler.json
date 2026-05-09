@@ -1,0 +1,77 @@
+{
+  "description": "use when referring to anything that has to do with measurement",
+  "text": "Explainer Video",
+  "template": "cut",
+  "circleCount": 4,
+  "fontFamily": "Bebas Neue",
+  "hSpacing": 270,
+  "vSpacing": 80,
+  "customCircleSize": 350,
+  "cols": 2,
+  "rows": 2,
+  "elements": [
+    {
+      "id": "1",
+      "type": "image",
+      "url": "",
+      "x": -420,
+      "y": 0,
+      "size": 36
+    },
+    {
+      "id": "1777604685744",
+      "type": "ruler",
+      "x": 590,
+      "y": 0,
+      "size": 40,
+      "rotation": 270,
+      "color": "#ef4444"
+    },
+    {
+      "id": "1777604699230",
+      "type": "arrow",
+      "x": 239,
+      "y": 0,
+      "size": 17,
+      "rotation": 0,
+      "color": "#ef4444"
+    }
+  ],
+  "showBorder": true,
+  "topicCuts": {},
+  "topicNodes": [
+    {
+      "title": "Topic 1",
+      "mediaUrl": "placeholder.png",
+      "script": "",
+      "audioUrl": ""
+    },
+    {
+      "title": "Topic 2",
+      "mediaUrl": "placeholder.png",
+      "script": "",
+      "audioUrl": ""
+    },
+    {
+      "title": "Topic 3",
+      "mediaUrl": "placeholder.png",
+      "script": "",
+      "audioUrl": ""
+    },
+    {
+      "title": "Topic 4",
+      "mediaUrl": "placeholder.png",
+      "script": "",
+      "audioUrl": ""
+    }
+  ],
+  "hudEnabled": false,
+  "hudTitleColor": "#ffffff",
+  "hudProgressColor": "#4f46e5",
+  "hudShowTitle": true,
+  "hudShowImage": true,
+  "hudShowProgress": true,
+  "hudTitleShadow": true,
+  "hudImageShadow": true,
+  "hudProgressBarShadow": true
+}

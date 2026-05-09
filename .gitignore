@@ -1,0 +1,45 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Environment Variables (CRITICAL)
+.env
+.env.*
+!.env.example
+
+# Saved Presets (These contain plain-text API keys from the UI!)
+presets/*.json
+!presets/default.json
+
+# Remotion Output Videos & Thumbnails
+out/
+
+# Generated TTS & Downloaded Media
+public/voice_*
+public/image_*
+public/video_*
+
+# Heavy Executables (yt-dlp, ffmpeg)
+bin/*
+!bin/README.md

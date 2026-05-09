@@ -1,0 +1,127 @@
+{
+  "aiProvider": "openrouter",
+  "aiModel": "google/gemma-3-27b-it",
+  "apiKey": "",
+  "scriptAiProvider": "anthropic",
+  "scriptAiModel": "claude-sonnet-4-6",
+  "scriptApiKey": "",
+  "ttsProvider": "elevenlabs",
+  "elApiKey": "",
+  "elVoiceId": "QIhD5ivPGEoYZQDocuHI",
+  "kokoroVoice": "af_bella",
+  "promptOutline": "You are a master YouTube documentary producer. Given a main topic and a desired number of segments, create a logical, engaging outline of sub-topics or characters to cover.\nEnsure there are EXACTLY the requested number of subtopics. Be highly specific with the subtopic names so the writer knows exactly what to cover.\nCRITICAL RULE: Keep the subtopic names VERY SHORT (maximum 2-4 words). Do not use long sentences. They must fit cleanly on screen as titles.\nOUTPUT EXACT JSON STRUCTURE:\n{ \"subtopics\": [\"<Short Title 1>\", \"<Short Title 2>\"] }",
+  "promptSegment": "You are a script writer for a highly detailed, long-form YouTube documentary channel. You will be given a Main Topic and a specific Sub-topic to focus on for this segment.\n\n**Layout rules:**\n- Write entirely in flowing prose paragraphs — never use lists, bold text, or section headers.\n- Each paragraph should be 5–8 sentences and flow naturally.\n- DO NOT include the sub-topic title in the script body itself. Just write the narration.\n- AIM FOR 400–600 WORDS for this specific segment. DO NOT BE BRIEF. Go into extreme, rich detail.\n\n**Tone and voice:**\n- Casual, conversational, and engaging — like a knowledgeable friend explaining something over a coffee.\n- Explain the \"why\" and \"how\", not just the \"what\". Use specific examples, lore, quotes, or historical context.\n- Vary sentence length throughout to create natural rhythm and pacing. Short punchy sentences. Then a longer one that builds on it.\n\n**Critical tone rules:**\n- AVOID poetic, overly metaphorical, or \"inspirational quote\" phrasing at all costs.\n- DO use casual filler language and natural spoken rhythms where it fits: \"and here's the thing...\", \"the crazy part is...\", \"umm, yeah, that actually happened\".\n- DO use light, dry humor when appropriate.\n- NEVER use hollow filler phrases like \"it's important to note that\" or \"one must consider\". Just say the thing.\n\n**TTS formatting rules:**\n- Use commas to create natural pauses within a sentence.\n- Paragraph breaks and newlines create long, awkward silences in TTS. Do NOT use a new paragraph as a stylistic pause. \n- Never write a word or phrase on its own line.\n- Dashes (—) are great for a quick interruption or an aside.\n- The final output should read like one clean, unbroken audio performance.\n\nOUTPUT EXACT JSON STRUCTURE:\n{ \"script\": \"<Your long, detailed script for this segment here>\" }",
+  "prompt1": "You are an editor. Analyze the explainer transcript and output ONLY a valid JSON object. No markdown.\n\nYour job:\n1. Identify all main topics/characters being explained.\n2. Break down the text for each topic into DISTINCT, SHORT SENTENCES (or visual beats) into an array. Do not lump multiple visual ideas into one sentence. Each sentence will become a separate video cut.\n\nOUTPUT EXACT JSON STRUCTURE: \n{ \"topics\": [ { \"label\": \"<Full Topic Name>\", \"sentences\": [\"<Sentence 1>\", \"<Sentence 2>\", \"<Sentence 3>\"] } ] }",
+  "prompt2": "You are a video layout director. You will receive a specific topic and its exact sentences. Output ONLY a valid JSON object. No markdown.\n\nYour job: For EVERY SINGLE SENTENCE provided, pick the best template from the SERVER TEMPLATES list to represent it visually. Do NOT generate search queries. Read the descriptions of the templates carefully to know when to use them!\n\nRULES:\n1. You MUST output exactly one moment per sentence provided.\n2. Estimate the duration for each sentence (~3 words = 1 second). Minimum 3s.\n3. If there are video templates (ones with 'vid' in the name), use them SPARINGLY (maximum ONCE per topic). Use image templates for the rest.\n\nOUTPUT EXACT JSON STRUCTURE: \n{ \"label\": \"<Topic Name>\", \"moments\": [ { \"sentence_index\": <number>, \"template\": \"<Template Name>\", \"duration_estimate\": <seconds> } ] }",
+  "prompt3": "You are a media researcher. You will receive a specific topic and its exact sentences. Output ONLY a valid JSON object. No markdown.\n\nYour job: For EVERY SINGLE SENTENCE, generate a CLEAN, 3-5 word 'search_query' for finding an image or video that perfectly matches that sentence visually.\n\nRULES:\n1. The system searches DuckDuckGo. Do NOT use special characters, quotes, or parentheses.\n2. Do NOT use abstract concepts. Use concrete visual keywords (e.g., use \"vintage 1950s computer lab\" instead of \"Early enthusiasm for machine solving\").\n\nOUTPUT EXACT JSON STRUCTURE: \n{ \"label\": \"<Topic Name>\", \"queries\": [ { \"sentence_index\": <number>, \"search_query\": \"<3-5 words>\" } ] }",
+  "sentencesPerCut": 2,
+  "gridConfigs": {
+    "1": {
+      "hSpacing": 80,
+      "vSpacing": 80,
+      "customCircleSize": 500,
+      "cols": 1,
+      "rows": 1
+    },
+    "2": {
+      "hSpacing": 230,
+      "vSpacing": 80,
+      "customCircleSize": 500,
+      "cols": 2,
+      "rows": 1
+    },
+    "3": {
+      "hSpacing": 250,
+      "vSpacing": 80,
+      "customCircleSize": 350,
+      "cols": 2,
+      "rows": 2
+    },
+    "4": {
+      "hSpacing": 270,
+      "vSpacing": 80,
+      "customCircleSize": 350,
+      "cols": 2,
+      "rows": 2
+    },
+    "5": {
+      "hSpacing": 270,
+      "vSpacing": 80,
+      "customCircleSize": 350,
+      "cols": 3,
+      "rows": 2
+    },
+    "6": {
+      "hSpacing": 270,
+      "vSpacing": 80,
+      "customCircleSize": 350,
+      "cols": 3,
+      "rows": 2
+    },
+    "7": {
+      "hSpacing": 125,
+      "vSpacing": 85,
+      "customCircleSize": 340,
+      "cols": 4,
+      "rows": 3
+    },
+    "8": {
+      "hSpacing": 125,
+      "vSpacing": 85,
+      "customCircleSize": 340,
+      "cols": 4,
+      "rows": 3
+    },
+    "9": {
+      "hSpacing": 190,
+      "vSpacing": 45,
+      "customCircleSize": 240,
+      "cols": 4,
+      "rows": 3
+    },
+    "10": {
+      "hSpacing": 190,
+      "vSpacing": 45,
+      "customCircleSize": 240,
+      "cols": 4,
+      "rows": 3
+    },
+    "11": {
+      "hSpacing": 190,
+      "vSpacing": 45,
+      "customCircleSize": 240,
+      "cols": 4,
+      "rows": 3
+    },
+    "12": {
+      "hSpacing": 190,
+      "vSpacing": 45,
+      "customCircleSize": 240,
+      "cols": 4,
+      "rows": 3
+    },
+    "13": {
+      "hSpacing": 135,
+      "vSpacing": 75,
+      "customCircleSize": 230,
+      "cols": 5,
+      "rows": 4
+    },
+    "14": {
+      "hSpacing": 135,
+      "vSpacing": 75,
+      "customCircleSize": 230,
+      "cols": 5,
+      "rows": 4
+    },
+    "15": {
+      "hSpacing": 135,
+      "vSpacing": 75,
+      "customCircleSize": 230,
+      "cols": 5,
+      "rows": 4
+    }
+  },
+  "defaultHudName": "",
+  "fontFamily": "Bebas Neue"
+}
