@@ -207,6 +207,7 @@ const RenderDynamicElement: React.FC<{ element: CutElement, entranceScale: numbe
 const HudOverlay: React.FC<{
   topic: TopicNode;
   duration: number;
+  format?: 'landscape' | 'portrait';
   fontFamily: string;
   hudTitleColor: string;
   hudProgressColor: string;
@@ -218,7 +219,7 @@ const HudOverlay: React.FC<{
   hudProgressBarShadow: boolean;
   defaultVideo: string;
 }> = ({ 
-  topic, duration, fontFamily, hudTitleColor, hudProgressColor, 
+  topic, duration, format, fontFamily, hudTitleColor, hudProgressColor, 
   hudShowTitle, hudShowImage, hudShowProgress, 
   hudTitleShadow, hudImageShadow, hudProgressBarShadow, defaultVideo
 }) => {
@@ -233,14 +234,30 @@ const HudOverlay: React.FC<{
   const hudMediaUrl = resolveMedia(topic.mediaUrl, defaultVideo);
   const isHudVideo = typeof hudMediaUrl === 'string' && (hudMediaUrl.toLowerCase().endsWith('.mp4') || hudMediaUrl.toLowerCase().endsWith('.webm') || hudMediaUrl.includes('supabase.co'));
   
+  const titleStyle: React.CSSProperties = format === 'portrait' ? {
+    position: 'absolute', bottom: 130, left: '50%', transform: 'translateX(-50%)',
+    width: '90%', textAlign: 'center', justifyContent: 'center'
+  } : {
+    position: 'absolute', top: 60, left: 60, width: 550, alignItems: 'flex-start'
+  };
+
+  const progressStyle: React.CSSProperties = format === 'portrait' ? {
+    position: 'absolute', bottom: 80, left: '50%', transform: 'translateX(-50%)', width: '80%'
+  } : {
+    position: 'absolute', top: 80, left: '50%', transform: 'translateX(-50%)', width: 600
+  };
+
+  const imageStyle: React.CSSProperties = format === 'portrait' ? {
+    position: 'absolute', top: 80, right: 60
+  } : {
+    position: 'absolute', top: 50, right: 60
+  };
+
   return (
     <AbsoluteFill style={{ opacity, pointerEvents: 'none', zIndex: 100 }}>
       {hudShowTitle && (
         <div style={{
-          position: 'absolute',
-          top: 60,
-          left: 60,
-          width: 550,
+          ...titleStyle,
           color: hudTitleColor,
           fontSize: 46,
           fontFamily,
@@ -250,7 +267,6 @@ const HudOverlay: React.FC<{
           textShadow: hudTitleShadow ? '0 4px 12px rgba(0,0,0,0.5)' : 'none',
           display: 'flex',
           flexWrap: 'wrap',
-          alignItems: 'flex-start',
         }}>
           {topic.title}
         </div>
@@ -258,11 +274,7 @@ const HudOverlay: React.FC<{
 
       {hudShowProgress && (
         <div style={{
-          position: 'absolute',
-          top: 80,
-          left: '50%',
-          transform: 'translateX(-50%)',
-          width: 600,
+          ...progressStyle,
           height: 12,
           backgroundColor: 'rgba(255,255,255,0.3)',
           borderRadius: 6,
@@ -280,9 +292,7 @@ const HudOverlay: React.FC<{
 
       {hudShowImage && (
         <div style={{
-          position: 'absolute',
-          top: 50,
-          right: 60,
+          ...imageStyle,
           width: 120,
           height: 120,
           borderRadius: '50%',
@@ -386,6 +396,7 @@ export const MyComposition: React.FC<MyCompositionProps> = (props) => {
         <HudOverlay 
           topic={dummyTopic}
           duration={150} 
+          format={format}
           fontFamily={selectedFont}
           hudTitleColor={hudTitleColor}
           hudProgressColor={hudProgressColor}
@@ -441,8 +452,15 @@ export const MyComposition: React.FC<MyCompositionProps> = (props) => {
   }
 
   if (template === 'explainer') {
-    const cols = manualCols || Math.ceil(Math.sqrt(circleCount));
-    const rows = Math.ceil(circleCount / cols);
+    let cols = manualCols || Math.ceil(Math.sqrt(circleCount));
+    let rows = manualRows || Math.ceil(circleCount / cols);
+    
+    // Auto-adjust layout to stack vertically for Portrait mode
+    if (format === 'portrait' && cols > rows) {
+      const temp = cols;
+      cols = rows;
+      rows = temp;
+    }
 
     const introDuration = 60; 
     const transitionDuration = 30; 
@@ -468,12 +486,11 @@ export const MyComposition: React.FC<MyCompositionProps> = (props) => {
 
     const labelMargin = 20;
     const labelHeight = customCircleSize * 0.12;
-    
-    // Dynamic max-height calculation to prevent text wrapping from overflowing the canvas
-    let maxLines = 1;
     const maxTextWidth = customCircleSize + (hSpacing * 0.8);
     const charsPerLine = Math.max(10, Math.floor(maxTextWidth / (labelHeight * 0.45))); // Approx chars per line for Bebas Neue
     
+    // Dynamic max-height calculation for the text block
+    let maxLines = 1;
     for (let i = 0; i < circleCount; i++) {
       const fallbackChar = FALLBACK_CHARACTERS[i % FALLBACK_CHARACTERS.length];
       const title = topicNodes[i]?.title || fallbackChar.name;
@@ -482,22 +499,28 @@ export const MyComposition: React.FC<MyCompositionProps> = (props) => {
     }
 
     const textBlockHeight = labelHeight * 1.1 * maxLines;
-    const totalItemHeight = customCircleSize + labelMargin + textBlockHeight;
+    
+    // THE FAKE BOX CONTAINER LOGIC
+    // We treat the circle and the text as one single strict bounding box
+    const itemWidth = maxTextWidth;
+    const itemHeight = customCircleSize + labelMargin + textBlockHeight;
+    
+    // The distance from the start of one box to the start of the next
+    const colStep = customCircleSize + hSpacing;
+    const rowStep = itemHeight + vSpacing;
+    
+    // Total bounds of all the fake boxes combined
+    const gridWidth = (cols - 1) * colStep + itemWidth;
+    const gridHeight = (rows - 1) * rowStep + itemHeight;
 
-    // ACCOUNT FOR TEXT SPILLOVER: The text can spill out hSpacing * 0.4 on both the far left and right sides
-    const textSpilloverPadding = hSpacing * 0.8; 
-    const gridWidth = (cols * customCircleSize) + ((cols - 1) * hSpacing) + textSpilloverPadding;
-    const gridHeight = (rows * totalItemHeight) + ((rows - 1) * vSpacing);
-
-    // Padding reduced: 85% ensures circles take up more space and don't feel too padded
     const fitScaleX = (width * 0.85) / gridWidth;
     const fitScaleY = (height * 0.85) / gridHeight;
     const baseScale = Math.min(1, fitScaleX, fitScaleY);
 
-    // Zoom padding dynamically adjusted so portrait doesn't leave massive vertical gaps
-    const zoomPadX = format === 'portrait' ? 0.95 : 0.85;
-    const zoomPadY = format === 'portrait' ? 0.85 : 0.75;
-    const targetZoom = Math.min((height * zoomPadY) / totalItemHeight, (width * zoomPadX) / maxTextWidth);
+    // Zoom padding dynamically adjusted for portrait modes bounds
+    const zoomPadX = format === 'portrait' ? 0.90 : 0.85;
+    const zoomPadY = format === 'portrait' ? 0.70 : 0.75;
+    const targetZoom = Math.min((height * zoomPadY) / itemHeight, (width * zoomPadX) / itemWidth);
 
     let cameraScale = baseScale;
     let cameraX = 0;
@@ -506,15 +529,16 @@ export const MyComposition: React.FC<MyCompositionProps> = (props) => {
     const getTargetPos = (index: number) => {
       const col = index % cols;
       const row = Math.floor(index / cols);
-      // We calculate center relative to the grid bounding box horizontally
-      const cellCenterX = (textSpilloverPadding / 2) + (col * (customCircleSize + hSpacing)) + (customCircleSize / 2);
       
-      // Fix for Centering: Target the physical center of the circle, instead of the bounding box that includes text
-      const visualCenterY = (customCircleSize / 2) + (labelMargin / 2);
-      const cellCenterY = row * (totalItemHeight + vSpacing) + visualCenterY;
+      // Calculate the exact mathematical center of the specific bounding box
+      const cellCenterX = (itemWidth / 2) + col * colStep;
+      const cellCenterY = (itemHeight / 2) + row * rowStep;
       
-      const relativeX = cellCenterX - gridWidth / 2;
-      const relativeY = cellCenterY - gridHeight / 2;
+      // Calculate how far off that point is from the center of the total grid
+      const relativeX = cellCenterX - (gridWidth / 2);
+      const relativeY = cellCenterY - (gridHeight / 2);
+      
+      // Move the camera in the opposite direction to perfectly frame it
       return { x: -relativeX, y: -relativeY };
     };
 
@@ -565,99 +589,99 @@ export const MyComposition: React.FC<MyCompositionProps> = (props) => {
     }
 
     return (
-      <AbsoluteFill style={{ backgroundColor: '#ffffff' }}>
+      <AbsoluteFill style={{ backgroundColor: '#ffffff', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        {/* The Grid Wrapper */}
         <div style={{
-          width: '100%',
-          height: '100%',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
+          width: gridWidth,
+          height: gridHeight,
+          position: 'relative',
           transform: `scale(${cameraScale}) translate(${cameraX / cameraScale}px, ${cameraY / cameraScale}px)`,
+          transformOrigin: 'center center',
         }}>
-          {/* Main Grid Wrapper with explicitly padded bounds */}
-          <div style={{ 
-            width: gridWidth,
-            height: gridHeight,
-            position: 'relative'
-          }}>
-            {Array.from({ length: circleCount }).map((_, i) => {
-              const fallbackChar = FALLBACK_CHARACTERS[i % FALLBACK_CHARACTERS.length];
-              const nodeTitle = topicNodes[i]?.title || fallbackChar.name;
-              const nodeImg = resolveMedia(topicNodes[i]?.mediaUrl, fallbackChar.img);
-              
-              const isNodeVideo = typeof nodeImg === 'string' && (nodeImg.toLowerCase().endsWith('.mp4') || nodeImg.toLowerCase().endsWith('.webm') || nodeImg.includes('supabase.co'));
+          {Array.from({ length: circleCount }).map((_, i) => {
+            const fallbackChar = FALLBACK_CHARACTERS[i % FALLBACK_CHARACTERS.length];
+            const nodeTitle = topicNodes[i]?.title || fallbackChar.name;
+            const nodeImg = resolveMedia(topicNodes[i]?.mediaUrl, fallbackChar.img);
+            
+            const isNodeVideo = typeof nodeImg === 'string' && (nodeImg.toLowerCase().endsWith('.mp4') || nodeImg.toLowerCase().endsWith('.webm') || nodeImg.includes('supabase.co'));
 
-              const delay = i * 3;
-              const entrance = spring({
-                frame: frame - 15 - delay,
-                fps,
-                config: { damping: 12, stiffness: 100 },
-              });
+            const delay = i * 3;
+            const entrance = spring({
+              frame: frame - 15 - delay,
+              fps,
+              config: { damping: 12, stiffness: 100 },
+            });
 
-              const opacity = interpolate(entrance, [0, 1], [0, 1]);
-              const scale = interpolate(entrance, [0, 1], [0.8, 1]);
-              const translateY = interpolate(entrance, [0, 1], [40, 0]);
+            const opacity = interpolate(entrance, [0, 1], [0, 1]);
+            const scale = interpolate(entrance, [0, 1], [0.8, 1]);
+            const translateY = interpolate(entrance, [0, 1], [40, 0]);
 
-              const col = i % cols;
-              const row = Math.floor(i / cols);
-              const leftPos = (textSpilloverPadding / 2) + col * (customCircleSize + hSpacing);
-              const topPos = row * (totalItemHeight + vSpacing);
+            const col = i % cols;
+            const row = Math.floor(i / cols);
+            
+            // Calculate absolute position using the strict bounding box approach
+            const centerX = (itemWidth / 2) + col * colStep;
+            const centerY = (itemHeight / 2) + row * rowStep;
+            
+            const leftPos = centerX - (itemWidth / 2);
+            const topPos = centerY - (itemHeight / 2);
 
-              return (
+            return (
+              <div
+                key={i}
+                style={{
+                  position: 'absolute',
+                  left: leftPos,
+                  top: topPos,
+                  width: itemWidth,
+                  height: itemHeight,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  opacity,
+                  transform: `scale(${scale}) translateY(${translateY}px)`,
+                  transformOrigin: 'center center'
+                }}
+              >
                 <div
-                  key={i}
                   style={{
-                    position: 'absolute',
-                    left: leftPos,
-                    top: topPos,
                     width: customCircleSize,
-                    display: 'flex',
-                    flexDirection: 'column',
-                    alignItems: 'center',
-                    opacity,
-                    transform: `scale(${scale}) translateY(${translateY}px)`,
-                    transformOrigin: 'center top'
+                    height: customCircleSize,
+                    borderRadius: '50%',
+                    overflow: 'hidden',
+                    backgroundColor: '#f1f5f9',
+                    boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.15)',
+                    border: showBorder ? '4px solid #0f172a' : 'none',
+                    flexShrink: 0
                   }}
                 >
-                  <div
-                    style={{
-                      width: customCircleSize,
-                      height: customCircleSize,
-                      borderRadius: '50%',
-                      overflow: 'hidden',
-                      backgroundColor: '#f1f5f9',
-                      boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.15)',
-                      border: showBorder ? '4px solid #0f172a' : 'none',
-                    }}
-                  >
-                    {isNodeVideo ? (
-                      <OffthreadVideo src={nodeImg as string} style={{ width: '100%', height: '100%', objectFit: 'cover' }} muted />
-                    ) : (
-                      <img src={nodeImg as string} style={{ width: '100%', height: '100%', objectFit: 'cover' }} alt={nodeTitle} />
-                    )}
-                  </div>
-                  <div style={{
-                    marginTop: labelMargin,
-                    fontSize: labelHeight,
-                    fontWeight: '600',
-                    color: '#0f172a',
-                    fontFamily: selectedFont,
-                    textTransform: 'uppercase',
-                    letterSpacing: '0.15em',
-                    textAlign: 'center',
-                    lineHeight: 1.1,
-                    width: maxTextWidth,
-                    wordWrap: 'break-word',
-                  }}>
-                    {nodeTitle}
-                  </div>
+                  {isNodeVideo ? (
+                    <OffthreadVideo src={nodeImg as string} style={{ width: '100%', height: '100%', objectFit: 'cover' }} muted />
+                  ) : (
+                    <img src={nodeImg as string} style={{ width: '100%', height: '100%', objectFit: 'cover' }} alt={nodeTitle} />
+                  )}
                 </div>
-              );
-            })}
-          </div>
+                <div style={{
+                  marginTop: labelMargin,
+                  fontSize: labelHeight,
+                  fontWeight: '600',
+                  color: '#0f172a',
+                  fontFamily: selectedFont,
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.15em',
+                  textAlign: 'center',
+                  lineHeight: 1.1,
+                  width: itemWidth,
+                  wordWrap: 'break-word',
+                }}>
+                  {nodeTitle}
+                </div>
+              </div>
+            );
+          })}
         </div>
 
-        {/* RENDER CUTS */}
+        {/* RENDER CUTS OVER THE WHOLE SCREEN */}
         {Array.from({ length: circleCount }).map((_, i) => {
           const cuts = topicCuts[i] || [];
           if (cuts.length === 0) return null;
@@ -709,6 +733,7 @@ export const MyComposition: React.FC<MyCompositionProps> = (props) => {
               <HudOverlay 
                 topic={{ title: nodeTitle, mediaUrl: nodeImgUrl }}
                 duration={cutsDuration}
+                format={format}
                 fontFamily={selectedFont}
                 hudTitleColor={hudTitleColor}
                 hudProgressColor={hudProgressColor}

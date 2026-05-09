@@ -7,7 +7,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } f
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
-import { Film, Trash2, ArrowLeft, Download, PlayCircle, Loader2, Play, AlertTriangle, MoreVertical, Copy } from 'lucide-react';
+import { Film, Trash2, ArrowLeft, Download, PlayCircle, Loader2, Play, AlertTriangle, MoreVertical, Copy, RefreshCw, Clock } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { showSuccess, showError, showLoading, dismissToast } from '@/utils/toast';
 import { supabase } from '@/lib/supabase';
@@ -181,6 +181,30 @@ const Library = () => {
     }
   };
 
+  const handleConvertFormat = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const toastId = showLoading("Fetching original video configs...");
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      const res = await fetch(`http://localhost:3001/api/renders/${id}/convert`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${session?.access_token || ''}` }
+      });
+      const data = await res.json();
+      
+      if (data.success) {
+        showSuccess(data.message);
+        setTimeout(() => navigate('/dashboard'), 1000);
+      } else {
+        throw new Error(data.error);
+      }
+    } catch (error: any) {
+      showError("Format conversion failed: " + error.message);
+    } finally {
+      dismissToast(toastId as unknown as string);
+    }
+  };
+
   const getAbsoluteUrl = (url: string) => {
     if (!url) return '';
     return url.startsWith('http') ? url : `http://localhost:3001/${url}`;
@@ -194,7 +218,13 @@ const Library = () => {
             <h1 className="text-3xl font-bold text-[#ffffff] flex items-center gap-2">
               <Film className="text-[#2d8ceb] h-8 w-8" /> Export Library
             </h1>
-            <p className="text-[#888888] text-sm mt-1">Watch and download all your previously exported videos.</p>
+            <div className="flex flex-col gap-2 mt-2">
+              <p className="text-[#888888] text-sm leading-none">Watch and download all your previously exported videos.</p>
+              <div className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md border border-amber-500/20 bg-amber-500/10 text-amber-400/90 text-[10px] font-bold uppercase tracking-wider w-fit mt-1">
+                <Clock className="h-3 w-3" />
+                Source media for format conversions expires after 14 days
+              </div>
+            </div>
           </div>
           <div className="flex flex-wrap items-center gap-4">
             <div className="flex items-center gap-3 bg-[#232323] border border-[#444444] px-3 py-2 rounded-lg shadow-sm">
@@ -231,6 +261,12 @@ const Library = () => {
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
             {renders.map((render) => {
               const isFailed = render.status === 'failed';
+              
+              // Calculate days left for assets
+              const msInDay = 1000 * 60 * 60 * 24;
+              const daysOld = (Date.now() - render.createdAt) / msInDay;
+              const daysLeft = Math.ceil(14 - daysOld);
+              const isExpired = daysLeft <= 0;
               
               return (
                 <Card 
@@ -276,7 +312,15 @@ const Library = () => {
                             </Button>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end" className="bg-[#232323] border-[#444444] text-[#eeeeee] w-48 shadow-xl">
-                            <div className="px-3 py-2 flex flex-col space-y-1">
+                            {!isFailed && !isExpired && (
+                              <DropdownMenuItem 
+                                onClick={(e) => handleConvertFormat(render.id, e)}
+                                className="text-xs cursor-pointer focus:bg-[#333333] focus:text-[#ffffff] text-amber-400 focus:text-amber-300"
+                              >
+                                <RefreshCw className="mr-2 h-3.5 w-3.5" /> Convert Format
+                              </DropdownMenuItem>
+                            )}
+                            <div className="px-3 py-2 flex flex-col space-y-1 mt-1">
                               <span className="text-[10px] font-bold text-[#888888] uppercase tracking-wider">S3 Export ID</span>
                               <span className="text-[11px] font-mono text-[#cccccc] break-all">{render.id}</span>
                             </div>
@@ -290,9 +334,16 @@ const Library = () => {
                           </DropdownMenuContent>
                         </DropdownMenu>
                       </div>
-                      <p className="text-[10px] text-[#888888] mt-1">
-                        {new Date(render.createdAt).toLocaleString()}
-                      </p>
+                      <div className="flex flex-col items-start gap-1 mt-1.5">
+                        <p className="text-[10px] text-[#888888]">
+                          {new Date(render.createdAt).toLocaleString()}
+                        </p>
+                        {!isFailed && (
+                          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${isExpired ? 'bg-red-500/10 text-red-400 border-red-500/20' : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'}`}>
+                            {isExpired ? 'Assets Expired' : `Assets: ${daysLeft}d left`}
+                          </span>
+                        )}
+                      </div>
                     </div>
                     
                     <div className="flex items-center gap-2 pt-2 border-t border-[#333333]">

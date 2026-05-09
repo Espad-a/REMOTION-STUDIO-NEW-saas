@@ -40,7 +40,10 @@ const Dashboard = () => {
 
   const fetchPresets = async () => {
     try {
-      const res = await fetch('http://localhost:3001/api/presets');
+      const { data: { session } } = await supabase.auth.getSession();
+      const headers: any = session ? { 'Authorization': `Bearer ${session.access_token}` } : {};
+
+      const res = await fetch('http://localhost:3001/api/presets', { headers });
       const data = await res.json();
       if (data.success) {
         setPresets(data.presets);

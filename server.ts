@@ -1,6 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
-import { renderMediaOnLambda, renderStillOnLambda, getRenderProgress, deleteRender } from '@remotion/lambda';
+import { renderMediaOnLambda, renderStillOnLambda, getRenderProgress, deleteRender, deploySite } from '@remotion/lambda';
 import { S3Client, ListObjectsV2Command, GetObjectCommand, PutObjectCommand, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import path from 'path';
@@ -103,7 +103,6 @@ const cleanPublicAssets = () => {
   for (const file of files) {
     if (file === 'placeholder.mp4' || file === 'placeholder.png' || file === 'vite.svg') continue;
     
-    // Automatically cleans images, videos, and generated voiceovers
     if (file.startsWith('image_') || file.startsWith('video_') || file.startsWith('voice_')) {
       try {
         fs.unlinkSync(path.join(publicDir, file));
@@ -116,24 +115,91 @@ const cleanPublicAssets = () => {
   }
 };
 
-const cleanS3Assets = async (region: string, bucketName: string, keys: string[]) => {
-  if (!keys.length) return;
+// ==========================================
+// 14-DAY AWS S3 AUTO-CLEANUP ROUTINE
+// ==========================================
+const cleanOldS3Assets = async (region: string, bucketName: string) => {
   try {
-    console.log(`\n☁️ Auto-cleanup: Sweeping temporary S3 cloud assets...`);
+    console.log(`\n☁️ Running 14-day auto-cleanup routine for S3 dynamic-assets...`);
     const s3Client = new S3Client({ region });
     
-    // Max 1000 keys per request in AWS S3, mapping the keys into the correct Object format
-    await s3Client.send(new DeleteObjectsCommand({
-      Bucket: bucketName,
-      Delete: {
-        Objects: keys.map(Key => ({ Key }))
-      }
-    }));
+    // Fetch all files in the dynamic-assets folder
+    const command = new ListObjectsV2Command({ Bucket: bucketName, Prefix: 'dynamic-assets/' });
+    const response = await s3Client.send(command);
     
-    console.log(`☁️ Deleted ${keys.length} temporary files from S3 Bucket.`);
-  } catch(e) {
-    console.error(`❌ Failed to clean up S3 assets:`, e);
+    if (!response.Contents || response.Contents.length === 0) {
+      console.log(`☁️ S3 Bucket dynamic-assets folder is empty.`);
+      return;
+    }
+    
+    const now = Date.now();
+    const fourteenDaysMs = 14 * 24 * 60 * 60 * 1000;
+    
+    // Filter files older than 14 days
+    const keysToDelete = response.Contents
+      .filter(obj => obj.LastModified && (now - obj.LastModified.getTime() > fourteenDaysMs))
+      .map(obj => obj.Key as string);
+      
+    if (keysToDelete.length > 0) {
+      // AWS allows a max of 1000 deletions per request, so we chunk it just in case
+      for (let i = 0; i < keysToDelete.length; i += 1000) {
+         const chunk = keysToDelete.slice(i, i + 1000);
+         await s3Client.send(new DeleteObjectsCommand({
+            Bucket: bucketName,
+            Delete: { Objects: chunk.map(Key => ({ Key })) }
+         }));
+      }
+      console.log(`☁️ Successfully deleted ${keysToDelete.length} expired S3 assets (older than 14 days). Storage saved!`);
+    } else {
+      console.log(`☁️ No expired S3 assets found. Files will be kept for conversions.`);
+    }
+  } catch (e) {
+    console.error(`❌ Failed to run S3 14-day cleanup:`, e);
   }
+};
+
+const getS3KeyFromUrl = (urlStr: string) => {
+  try {
+    const urlObj = new URL(urlStr);
+    let key = urlObj.pathname.startsWith('/') ? urlObj.pathname.substring(1) : urlObj.pathname;
+    return decodeURIComponent(key);
+  } catch {
+    return null;
+  }
+};
+
+// Helper to deeply traverse an object and refresh any expired AWS presigned URLs
+const refreshPresignedUrls = async (obj: any, s3Client: S3Client, bucketName: string): Promise<any> => {
+  if (!obj) return obj;
+  if (typeof obj === 'string') {
+    if (obj.includes('amazonaws.com') && obj.includes('X-Amz-Signature')) {
+      const key = getS3KeyFromUrl(obj);
+      if (key) {
+        try {
+          const command = new GetObjectCommand({ Bucket: bucketName, Key: key });
+          return await getSignedUrl(s3Client, command, { expiresIn: 21600 });
+        } catch (e) {
+          return obj;
+        }
+      }
+    }
+    return obj;
+  }
+  if (Array.isArray(obj)) {
+    const arr = [];
+    for (let i = 0; i < obj.length; i++) {
+      arr[i] = await refreshPresignedUrls(obj[i], s3Client, bucketName);
+    }
+    return arr;
+  }
+  if (typeof obj === 'object') {
+    const newObj: any = {};
+    for (const key of Object.keys(obj)) {
+      newObj[key] = await refreshPresignedUrls(obj[key], s3Client, bucketName);
+    }
+    return newObj;
+  }
+  return obj;
 };
 
 app.post('/api/render', requireAuth, async (req, res) => {
@@ -149,13 +215,14 @@ app.post('/api/render', requireAuth, async (req, res) => {
   
   let region = 'us-east-1';
   let bucketName = '';
-  let uploadedS3Keys: string[] = []; 
   
   try {
     const functionName = process.env.REMOTION_FUNCTION_NAME;
     const serveUrl = process.env.REMOTION_SERVE_URL;
     bucketName = process.env.REMOTION_BUCKET_NAME || '';
     region = (process.env.REMOTION_AWS_REGION as any) || 'us-east-1';
+    
+    const framesPerLambda = parseInt(process.env.REMOTION_FRAMES_PER_LAMBDA || '900', 10);
 
     if (!functionName || !serveUrl || !bucketName) {
       throw new Error("Missing REMOTION_FUNCTION_NAME, REMOTION_SERVE_URL, or REMOTION_BUCKET_NAME in .env. Please run the deploy script first.");
@@ -190,10 +257,8 @@ app.post('/api/render', requireAuth, async (req, res) => {
          ContentType: contentType
       }));
       
-      uploadedS3Keys.push(key); 
-      
       const command = new GetObjectCommand({ Bucket: bucketName, Key: key });
-      const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 21600 }); 
+      const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 21600 });
       uploadedCache.set(url, signedUrl);
       return signedUrl;
     };
@@ -223,7 +288,7 @@ app.post('/api/render', requireAuth, async (req, res) => {
       }
     }
 
-    console.log(`🎬 Starting Remotion render on AWS Lambda...`);
+    console.log(`🎬 Starting Remotion render on AWS Lambda (framesPerLambda: ${framesPerLambda})...`);
     res.write(JSON.stringify({ type: 'info', message: 'Triggering AWS Lambda render...' }) + '\n');
 
     const { renderId } = await renderMediaOnLambda({
@@ -234,7 +299,7 @@ app.post('/api/render', requireAuth, async (req, res) => {
       inputProps,
       codec: 'h264',
       privacy: 'public', 
-      framesPerLambda: 4500, 
+      framesPerLambda,
     });
 
     console.log(`λ Lambda Job Started: ${renderId}`);
@@ -295,6 +360,18 @@ app.post('/api/render', requireAuth, async (req, res) => {
     const safeTitle = (inputProps.text || 'video').replace(/[^a-zA-Z0-9]/g, '_').toLowerCase().substring(0, 30);
     const jobFolderName = `${safeTitle}_${timestamp}`;
 
+    console.log(`📝 Saving input.json config to S3...`);
+    try {
+      await s3Client.send(new PutObjectCommand({
+         Bucket: bucketName,
+         Key: `renders/${renderId}/input.json`,
+         Body: JSON.stringify(inputProps),
+         ContentType: 'application/json'
+      }));
+    } catch(e) {
+      console.error("Failed to save input.json", e);
+    }
+
     await supabaseAdmin.from('video_exports').upsert({
       id: renderId,
       user_id: userId,
@@ -318,15 +395,110 @@ app.post('/api/render', requireAuth, async (req, res) => {
     res.write(JSON.stringify({ type: 'error', error: error.message }) + '\n');
     res.end();
   } finally {
+    // RUN CLEANUPS ASYNCHRONOUSLY AFTER RENDER
     setTimeout(() => {
       cleanPublicAssets();
-      if (bucketName && uploadedS3Keys.length > 0) {
-        cleanS3Assets(region, bucketName, uploadedS3Keys);
+      if (bucketName) {
+        cleanOldS3Assets(region, bucketName);
       }
     }, 2000);
   }
 });
 
+// VERIFY ADMIN PIN ENDPOINT
+app.post('/api/admin/verify-pin', requireAuth, (req, res) => {
+  const { pin } = req.body;
+  const validPin = process.env.ADMIN_PIN || '1234';
+  
+  if (pin === validPin) {
+    res.json({ success: true });
+  } else {
+    res.status(401).json({ success: false, error: 'Invalid PIN' });
+  }
+});
+
+// ADMIN CONFIG ENDPOINTS
+app.post('/api/admin/config', requireAuth, async (req, res) => {
+  try {
+    const { pin, framesPerLambda } = req.body;
+    const validPin = process.env.ADMIN_PIN || '1234';
+    
+    if (pin !== validPin) {
+      return res.status(403).json({ error: "Invalid Admin PIN provided." });
+    }
+
+    const envPath = path.resolve('./.env');
+    let envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf-8') : '';
+    
+    const regex = new RegExp(`^REMOTION_FRAMES_PER_LAMBDA=.*$`, 'm');
+    if (regex.test(envContent)) {
+      envContent = envContent.replace(regex, `REMOTION_FRAMES_PER_LAMBDA=${framesPerLambda}`);
+    } else {
+      envContent += `\nREMOTION_FRAMES_PER_LAMBDA=${framesPerLambda}`;
+    }
+    
+    fs.writeFileSync(envPath, envContent.trim() + '\n');
+    process.env.REMOTION_FRAMES_PER_LAMBDA = framesPerLambda;
+    
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/admin/config', requireAuth, (req, res) => {
+  res.json({ 
+    success: true, 
+    framesPerLambda: process.env.REMOTION_FRAMES_PER_LAMBDA || '900' 
+  });
+});
+
+// DEPLOY SITE TO AWS LAMBDA ROUTE
+app.post('/api/admin/deploy-site', requireAuth, async (req, res) => {
+  try {
+    const { pin } = req.body;
+    const validPin = process.env.ADMIN_PIN || '1234';
+    
+    if (pin !== validPin) {
+      return res.status(403).json({ error: "Invalid Admin PIN provided." });
+    }
+
+    const bucketName = process.env.REMOTION_BUCKET_NAME;
+    const region = (process.env.REMOTION_AWS_REGION as any) || 'us-east-1';
+    
+    if (!bucketName) {
+      throw new Error("Missing REMOTION_BUCKET_NAME in .env file. Please configure AWS first.");
+    }
+    
+    console.log(`📦 Deploying updated Remotion site to S3 (${bucketName})...`);
+    
+    const { serveUrl } = await deploySite({
+      entryPoint: path.resolve('./src/remotion/index.ts'),
+      bucketName,
+      region,
+    });
+    
+    console.log(`✅ Site deployed to: ${serveUrl}`);
+    
+    const envPath = path.resolve('./.env');
+    let envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf-8') : '';
+    const regex = new RegExp(`^REMOTION_SERVE_URL=.*$`, 'm');
+    
+    if (regex.test(envContent)) {
+      envContent = envContent.replace(regex, `REMOTION_SERVE_URL=${serveUrl}`);
+    } else {
+      envContent += `\nREMOTION_SERVE_URL=${serveUrl}`;
+    }
+    
+    fs.writeFileSync(envPath, envContent.trim() + '\n');
+    process.env.REMOTION_SERVE_URL = serveUrl;
+    
+    res.json({ success: true, serveUrl });
+  } catch (error: any) {
+    console.error("Deploy Error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 // Template API
 app.post('/api/templates', requireAuth, async (req, res) => {
@@ -416,7 +588,6 @@ app.get('/api/templates/:name', optionalAuth, async (req, res) => {
   res.status(404).json({ error: 'Template not found' });
 });
 
-
 // Presets API
 app.post('/api/presets', requireAuth, async (req, res) => {
   const { name, config } = req.body;
@@ -505,7 +676,6 @@ app.get('/api/presets/:name', optionalAuth, async (req, res) => {
   res.status(404).json({ error: 'Preset not found' });
 });
 
-
 // Voice API
 app.post('/api/elevenlabs/generate', async (req, res) => {
   try {
@@ -578,7 +748,6 @@ app.post('/api/llm/generate', async (req, res) => {
   try {
     const { system, user, provider, model, useScriptKey } = req.body;
     
-    // Choose which API key to use securely from the server environment
     let key = useScriptKey
         ? (process.env.SCRIPT_API_KEY || process.env.VITE_SCRIPT_API_KEY || process.env.GLOBAL_API_KEY || process.env.VITE_GLOBAL_API_KEY)
         : (process.env.GLOBAL_API_KEY || process.env.VITE_GLOBAL_API_KEY);
@@ -649,7 +818,6 @@ app.post('/api/media/download-youtube', async (req, res) => {
     const publicDir = path.resolve('./public');
     const outputPath = path.join(publicDir, filename);
     
-    // Production-ready executable resolution
     let downloaderPath = 'yt-dlp';
     let hasFfmpeg = false;
     let useBinDir = false;
@@ -664,7 +832,6 @@ app.post('/api/media/download-youtube', async (req, res) => {
       }
     }
 
-    // Check system for ffmpeg first, fallback to bin folder
     try { 
       await execFilePromise('ffmpeg', ['-version']); 
       hasFfmpeg = true; 
@@ -675,7 +842,7 @@ app.post('/api/media/download-youtube', async (req, res) => {
     }
 
     const args = ['--no-playlist', '-o', outputPath];
-    if (hasFfmpeg && useBinDir) args.push('--ffmpeg-location', binDir); // Only provide explicit path if using local bin
+    if (hasFfmpeg && useBinDir) args.push('--ffmpeg-location', binDir);
 
     if (durationSecs) {
       if (!hasFfmpeg) throw new Error("FFmpeg missing. Required for slicing.");
@@ -689,7 +856,6 @@ app.post('/api/media/download-youtube', async (req, res) => {
     try {
       await execFilePromise(downloaderPath, args);
     } catch (err: any) {
-      // If the system command fails and we aren't already using bin, give a helpful error
       if (!useBinDir) {
          throw new Error(`Failed to execute system yt-dlp. Make sure it is installed on the server (e.g. 'pip install yt-dlp') or placed in the bin/ folder.`);
       }
@@ -701,17 +867,6 @@ app.post('/api/media/download-youtube', async (req, res) => {
   } catch (error: any) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// Helper to extract S3 keys from URLs
-const getS3KeyFromUrl = (urlStr: string) => {
-  try {
-    const urlObj = new URL(urlStr);
-    return urlObj.pathname.startsWith('/') ? urlObj.pathname.substring(1) : urlObj.pathname;
-  } catch {
-    return null;
-  }
-};
-
-// PRESIGN MULTIPLE S3 URLS
 app.post('/api/renders/presign', requireAuth, async (req, res) => {
   try {
     const { keys } = req.body;
@@ -737,7 +892,7 @@ app.post('/api/renders/presign', requireAuth, async (req, res) => {
       }
       try {
         const command = new GetObjectCommand({ Bucket: bucketName, Key: key });
-        urlMap[urlOrKey] = await getSignedUrl(s3Client, command, { expiresIn: 21600 }); // 6 hours
+        urlMap[urlOrKey] = await getSignedUrl(s3Client, command, { expiresIn: 21600 });
       } catch(e) {
         urlMap[urlOrKey] = urlOrKey;
       }
@@ -749,7 +904,6 @@ app.post('/api/renders/presign', requireAuth, async (req, res) => {
   }
 });
 
-// DELETE RENDER FROM S3 & SUPABASE
 app.delete('/api/renders/:id', requireAuth, async (req, res) => {
   try {
     const bucketName = process.env.REMOTION_BUCKET_NAME;
@@ -782,7 +936,6 @@ app.delete('/api/renders/:id', requireAuth, async (req, res) => {
   }
 });
 
-// PRESIGNED DOWNLOAD URL ENDPOINT
 app.get('/api/renders/:id/download-url', async (req, res) => {
   try {
     const bucketName = process.env.REMOTION_BUCKET_NAME;
@@ -812,6 +965,134 @@ app.get('/api/renders/:id/download-url', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+app.post('/api/renders/:id/convert', requireAuth, async (req, res) => {
+  try {
+    const renderId = req.params.id;
+    const userId = (req as any).user.sub;
+    const bucketName = process.env.REMOTION_BUCKET_NAME;
+    const region = (process.env.REMOTION_AWS_REGION as any) || 'us-east-1';
+    const functionName = process.env.REMOTION_FUNCTION_NAME;
+    const serveUrl = process.env.REMOTION_SERVE_URL;
+
+    const framesPerLambda = parseInt(process.env.REMOTION_FRAMES_PER_LAMBDA || '900', 10);
+
+    if (!bucketName || !functionName || !serveUrl) {
+      throw new Error("AWS Config missing. Deploy your site first.");
+    }
+
+    const s3Client = new S3Client({ region });
+    let inputProps;
+    
+    try {
+      const getObj = await s3Client.send(new GetObjectCommand({
+        Bucket: bucketName,
+        Key: `renders/${renderId}/input.json`
+      }));
+      const bodyString = await getObj.Body?.transformToString();
+      if (!bodyString) throw new Error("Empty body");
+      inputProps = JSON.parse(bodyString);
+    } catch(e) {
+      throw new Error("Could not find original input.json on AWS. This video might be too old to convert.");
+    }
+
+    // Refresh any expired presigned URLs before passing to Lambda
+    inputProps = await refreshPresignedUrls(inputProps, s3Client, bucketName);
+
+    const oldFormat = inputProps.format || 'landscape';
+    const newFormat = oldFormat === 'portrait' ? 'landscape' : 'portrait';
+    inputProps.format = newFormat;
+    
+    if (inputProps.cols && inputProps.rows) {
+       const temp = inputProps.cols;
+       inputProps.cols = inputProps.rows;
+       inputProps.rows = temp;
+    }
+
+    const newJobId = `job_convert_${Date.now()}`;
+    jobs.set(newJobId, { 
+      id: newJobId, status: 'queued', progress: 0, step: 'Initializing Conversion', logs: []
+    });
+    
+    res.json({ success: true, jobId: newJobId, newFormat, message: `Conversion to ${newFormat} started! Head to the Automation Dashboard to view its progress.` });
+    
+    (async () => {
+      const job = jobs.get(newJobId)!;
+      try {
+        job.status = 'running';
+        job.step = `Rendering ${newFormat} Video`;
+        job.progress = 10;
+        job.logs.push({ time: new Date().toLocaleTimeString(), msg: `Starting AWS Lambda render for ${newFormat}...`, type: 'info' });
+
+        const { renderId: newRenderId } = await renderMediaOnLambda({
+          region, functionName, serveUrl, composition: 'MyVideo',
+          inputProps, codec: 'h264', privacy: 'public', framesPerLambda
+        });
+
+        job.logs.push({ time: new Date().toLocaleTimeString(), msg: `Lambda Render Started: ${newRenderId}`, type: 'info' });
+
+        await supabaseAdmin.from('video_exports').upsert({
+          id: newRenderId, user_id: userId, title: `${inputProps.text || 'Video'} (${newFormat})`,
+          video_url: '', thumbnail_url: '', created_at: Date.now(), status: 'failed'
+        });
+
+        let renderDone = false;
+        let outputUrl = '';
+
+        while (!renderDone) {
+          await delayFn(2000);
+          const progress = await getRenderProgress({ renderId: newRenderId, bucketName, functionName, region });
+          if (progress.fatalErrorEncountered) throw new Error(progress.errors[0]?.message || 'Lambda render fatal error');
+          if (progress.done && progress.outputFile) {
+            renderDone = true; outputUrl = progress.outputFile;
+          } else {
+            job.progress = 10 + Math.round(progress.overallProgress * 80);
+          }
+        }
+
+        job.logs.push({ time: new Date().toLocaleTimeString(), msg: `Generating thumbnail...`, type: 'info' });
+        const { url: thumbnailUrl } = await renderStillOnLambda({
+          region, functionName, serveUrl, composition: 'MyVideo',
+          inputProps, frame: 59, imageFormat: 'jpeg', privacy: 'public'
+        });
+
+        await s3Client.send(new PutObjectCommand({
+           Bucket: bucketName, Key: `renders/${newRenderId}/input.json`,
+           Body: JSON.stringify(inputProps), ContentType: 'application/json'
+        }));
+
+        await supabaseAdmin.from('video_exports').upsert({
+          id: newRenderId, user_id: userId, title: `${inputProps.text || 'Video'} (${newFormat})`,
+          video_url: outputUrl, thumbnail_url: thumbnailUrl, created_at: Date.now(), status: 'completed'
+        });
+
+        job.progress = 100;
+        job.status = 'completed';
+        job.step = 'Finished';
+        job.videoUrl = outputUrl;
+        job.thumbnailUrl = thumbnailUrl;
+        job.logs.push({ time: new Date().toLocaleTimeString(), msg: `Conversion Complete!`, type: 'success' });
+
+      } catch(err:any) {
+        job.status = 'failed';
+        job.error = err.message;
+        job.step = 'Error';
+        job.logs.push({ time: new Date().toLocaleTimeString(), msg: `Conversion Failed: ${err.message}`, type: 'error' });
+      } finally {
+        setTimeout(() => {
+          cleanPublicAssets();
+          if (process.env.REMOTION_BUCKET_NAME) {
+            cleanOldS3Assets(process.env.REMOTION_AWS_REGION || 'us-east-1', process.env.REMOTION_BUCKET_NAME);
+          }
+        }, 2000);
+      }
+    })();
+
+  } catch (error: any) {
+     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 
 // =====================================
 // HEADLESS AUTOMATION PIPELINE (JOBS)
@@ -883,7 +1164,6 @@ const DEFAULT_PROMPT_1 = `You are an editor. Analyze the explainer transcript an
 const DEFAULT_PROMPT_2 = `You are a video layout director. You will receive a specific topic and its exact sentences. Output ONLY a valid JSON object. No markdown.\n\nYour job: For EVERY SINGLE SENTENCE provided, pick the best template from the SERVER TEMPLATES list to represent it visually. Do NOT generate search queries. Read the descriptions of the templates carefully to know when to use them!\n\nRULES:\n1. You MUST output exactly one moment per sentence provided.\n2. Estimate the duration for each sentence (~3 words = 1 second). Minimum 3s.\n3. If there are video templates (ones with 'vid' in the name), use them SPARINGLY (maximum ONCE per topic). Use image templates for the rest.\n\nOUTPUT EXACT JSON STRUCTURE: \n{ "label": "<Topic Name>", "moments": [ { "sentence_index": <number>, "template": "<Template Name>", "duration_estimate": <seconds> } ] }`;
 const DEFAULT_PROMPT_3 = `You are a media researcher. You will receive a specific topic and its exact sentences. Output ONLY a valid JSON object. No markdown.\n\nYour job: For EVERY SINGLE SENTENCE, generate a CLEAN, 3-5 word 'search_query' for finding an image or video that perfectly matches that sentence visually.\n\nRULES:\n1. The system searches DuckDuckGo. Do NOT use special characters, quotes, or parentheses.\n2. Do NOT use abstract concepts. Use concrete visual keywords (e.g., use "vintage 1950s computer lab" instead of "Early enthusiasm for machine solving").\n\nOUTPUT EXACT JSON STRUCTURE: \n{ "label": "<Topic Name>", "queries": [ { "sentence_index": <number>, "search_query": "<3-5 words>" } ] }`;
 
-
 async function callLLMServer(systemMessage: string, userMessage: string, provider: string, model: string, apiKey: string) {
   if (provider === 'anthropic') {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -927,13 +1207,29 @@ async function runJob(jobId: string, payload: any, userId: string) {
     let finalConfig = { ...payload };
 
     if (payload.preset) {
-      log(`📦 Loading preset config from: ${payload.preset}.json`);
-      const presetPath = path.join(presetsDir, `${payload.preset}.json`);
-      if (fs.existsSync(presetPath)) {
-        const presetData = JSON.parse(fs.readFileSync(presetPath, 'utf-8'));
+      log(`📦 Loading preset config for: ${payload.preset}`);
+      let presetData = null;
+
+      let query = supabaseAdmin.from('presets').select('config').eq('name', payload.preset);
+      if (userId) query = query.or(`is_global.eq.true,user_id.eq.${userId}`);
+      else query = query.eq('is_global', true);
+
+      const { data } = await query.limit(1);
+      if (data && data.length > 0) {
+        presetData = data[0].config;
+        log(`☁️ Loaded preset from Cloud Database.`);
+      } else {
+        const presetPath = path.join(presetsDir, `${payload.preset}.json`);
+        if (fs.existsSync(presetPath)) {
+          presetData = JSON.parse(fs.readFileSync(presetPath, 'utf-8'));
+          log(`📁 Loaded preset from Local Filesystem.`);
+        }
+      }
+
+      if (presetData) {
         finalConfig = { ...presetData, ...payload };
       } else {
-        throw new Error(`Preset "${payload.preset}" not found on server.`);
+        throw new Error(`Preset "${payload.preset}" not found on server or cloud.`);
       }
     }
 
@@ -962,7 +1258,6 @@ async function runJob(jobId: string, payload: any, userId: string) {
 
     const isTestMode = test === true || test === 'true';
 
-    // Using exclusively Server Environment Variables for API Keys
     const activeAiKey = process.env.GLOBAL_API_KEY || process.env.VITE_GLOBAL_API_KEY;
     const activeScriptKey = process.env.SCRIPT_API_KEY || process.env.VITE_SCRIPT_API_KEY || activeAiKey;
 
@@ -994,7 +1289,6 @@ async function runJob(jobId: string, payload: any, userId: string) {
         topicCuts[i] = [];
       }
     } else {
-      // Step 1: Scripting
       job.step = 'Generating Script';
       log(`🎯 Topic Selected: ${mainTopic}`, 'info');
       
@@ -1022,7 +1316,6 @@ async function runJob(jobId: string, payload: any, userId: string) {
       fullScript += `category: ${mainTopic}`;
       log('✅ Script generation complete.', 'success');
 
-      // Step 2: Editor Pipeline
       job.step = 'Executing AI Director Pipeline';
       job.progress = 25;
       log('✂️ Extracting topics & splitting sentences...', 'info');
@@ -1030,8 +1323,21 @@ async function runJob(jobId: string, payload: any, userId: string) {
       const topics = step1Data.topics || [];
       if (topics.length === 0) throw new Error("AI found no topics.");
 
-      const templatesFiles = fs.readdirSync(templatesDir).filter(f => f.endsWith('.json'));
-      const fullTemplates = templatesFiles.map(f => ({ name: f.replace('.json',''), ...JSON.parse(fs.readFileSync(path.join(templatesDir, f), 'utf-8')) }));
+      let tQuery = supabaseAdmin.from('templates').select('name, config');
+      if (userId) tQuery = tQuery.or(`is_global.eq.true,user_id.eq.${userId}`);
+      else tQuery = tQuery.eq('is_global', true);
+      
+      const { data: cloudTData } = await tQuery;
+      const cloudTemplates = (cloudTData || []).map(t => ({ name: t.name, ...t.config }));
+      
+      const templatesFiles = fs.existsSync(templatesDir) ? fs.readdirSync(templatesDir).filter(f => f.endsWith('.json')) : [];
+      const localTemplates = templatesFiles.map(f => ({ name: f.replace('.json',''), ...JSON.parse(fs.readFileSync(path.join(templatesDir, f), 'utf-8')) }));
+      
+      const tplMap = new Map();
+      localTemplates.forEach(t => tplMap.set(t.name, t));
+      cloudTemplates.forEach(t => tplMap.set(t.name, t));
+      const fullTemplates = Array.from(tplMap.values());
+
       const cutTemplates = fullTemplates.filter(t => t.template === 'cut');
       const serverTemplatesList = cutTemplates.map(t => `- ${t.name}: ${t.description || 'General use'}`).join('\n');
 
@@ -1185,13 +1491,38 @@ async function runJob(jobId: string, payload: any, userId: string) {
     
     let defaultHudConfig = { hudTitleColor: '#fff', hudProgressColor: '#ccc', hudShowTitle: true, hudShowImage: true, hudShowProgress: true, hudTitleShadow: true, hudImageShadow: true, hudProgressBarShadow: true };
     if (defaultHudName) {
-      const hudPath = path.join(templatesDir, `${defaultHudName}.json`);
-      if (fs.existsSync(hudPath)) {
-        defaultHudConfig = { ...defaultHudConfig, ...JSON.parse(fs.readFileSync(hudPath, 'utf-8')) };
-      }
+      // Re-fetch templates locally since we already built the fullTemplates list
+      let tQuery = supabaseAdmin.from('templates').select('name, config');
+      if (userId) tQuery = tQuery.or(`is_global.eq.true,user_id.eq.${userId}`);
+      else tQuery = tQuery.eq('is_global', true);
+      const { data: cloudTData } = await tQuery;
+      const cloudTemplates = (cloudTData || []).map(t => ({ name: t.name, ...t.config }));
+      
+      const templatesFiles = fs.existsSync(templatesDir) ? fs.readdirSync(templatesDir).filter(f => f.endsWith('.json')) : [];
+      const localTemplates = templatesFiles.map(f => ({ name: f.replace('.json',''), ...JSON.parse(fs.readFileSync(path.join(templatesDir, f), 'utf-8')) }));
+      
+      const tplMap = new Map();
+      localTemplates.forEach(t => tplMap.set(t.name, t));
+      cloudTemplates.forEach(t => tplMap.set(t.name, t));
+      const fullTemplates = Array.from(tplMap.values());
+
+      const activeHud = fullTemplates.find(t => t.name === defaultHudName);
+      if (activeHud) defaultHudConfig = { ...defaultHudConfig, ...activeHud };
     } else {
-      const templatesFiles = fs.readdirSync(templatesDir).filter(f => f.endsWith('.json'));
-      const fullTemplates = templatesFiles.map(f => ({ name: f.replace('.json',''), ...JSON.parse(fs.readFileSync(path.join(templatesDir, f), 'utf-8')) }));
+      let tQuery = supabaseAdmin.from('templates').select('name, config');
+      if (userId) tQuery = tQuery.or(`is_global.eq.true,user_id.eq.${userId}`);
+      else tQuery = tQuery.eq('is_global', true);
+      const { data: cloudTData } = await tQuery;
+      const cloudTemplates = (cloudTData || []).map(t => ({ name: t.name, ...t.config }));
+      
+      const templatesFiles = fs.existsSync(templatesDir) ? fs.readdirSync(templatesDir).filter(f => f.endsWith('.json')) : [];
+      const localTemplates = templatesFiles.map(f => ({ name: f.replace('.json',''), ...JSON.parse(fs.readFileSync(path.join(templatesDir, f), 'utf-8')) }));
+      
+      const tplMap = new Map();
+      localTemplates.forEach(t => tplMap.set(t.name, t));
+      cloudTemplates.forEach(t => tplMap.set(t.name, t));
+      const fullTemplates = Array.from(tplMap.values());
+
       const hudTpl = fullTemplates.find(t => t.template === 'hud');
       if (hudTpl) defaultHudConfig = { ...defaultHudConfig, ...hudTpl };
     }
@@ -1293,7 +1624,13 @@ async function runJob(jobId: string, payload: any, userId: string) {
     log(`❌ Automation Failed: ${error.message}`, 'error');
     if (job.webhookUrl) job.webhookStatus = 'failed';
   } finally {
-    setTimeout(() => cleanPublicAssets(), 2000);
+    // RUN CLEANUPS ASYNCHRONOUSLY AFTER RENDER
+    setTimeout(() => {
+      cleanPublicAssets();
+      if (process.env.REMOTION_BUCKET_NAME) {
+        cleanOldS3Assets(process.env.REMOTION_AWS_REGION || 'us-east-1', process.env.REMOTION_BUCKET_NAME);
+      }
+    }, 2000);
   }
 }
 
@@ -1354,15 +1691,16 @@ app.post('/api/test-webhook', async (req, res) => {
   }
 });
 
-
-// Serve static files from the React app build directory
 const distPath = path.resolve('./dist');
 if (fs.existsSync(distPath)) {
   app.use(express.static(distPath));
-  // Catch-all route to serve index.html for React Router
-  app.get('/(.*)', (req, res, next) => {
-    if (req.path.startsWith('/api')) return next();
-    res.sendFile(path.join(distPath, 'index.html'));
+  
+  app.use((req, res, next) => {
+    if (req.method === 'GET' && !req.path.startsWith('/api')) {
+      res.sendFile(path.join(distPath, 'index.html'));
+    } else {
+      next();
+    }
   });
 }
 
