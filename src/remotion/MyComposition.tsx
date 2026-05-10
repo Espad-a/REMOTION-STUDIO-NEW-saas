@@ -89,6 +89,12 @@ interface MyCompositionProps {
   defaultVideo?: string;
 }
 
+const isVideoFormat = (url: string | unknown) => {
+  if (typeof url !== 'string') return false;
+  const clean = url.split('?')[0].toLowerCase();
+  return clean.endsWith('.mp4') || clean.endsWith('.webm') || clean.endsWith('.mov') || clean.endsWith('.mkv');
+};
+
 const resolveMedia = (url: string | undefined | null, defaultFallback: string) => {
   if (!url) return defaultFallback.startsWith('http') ? defaultFallback : staticFile(defaultFallback);
   if (url.startsWith('http') || url.startsWith('data:') || url.startsWith('blob:')) return url;
@@ -137,7 +143,7 @@ const RenderDynamicElement: React.FC<{ element: CutElement, entranceScale: numbe
     element.type === 'video' ? defaultVideo : 'placeholder.png'
   );
 
-  const isVideoFile = typeof finalUrl === 'string' && (finalUrl.toLowerCase().endsWith('.mp4') || finalUrl.toLowerCase().endsWith('.webm') || finalUrl.toLowerCase().endsWith('.mov') || finalUrl.includes('supabase.co'));
+  const isVideoFile = isVideoFormat(finalUrl);
 
   return (
     <div style={{
@@ -150,11 +156,11 @@ const RenderDynamicElement: React.FC<{ element: CutElement, entranceScale: numbe
       transform,
     }}>
       {(element.type === 'video' || element.type === 'image') && isVideoFile && (
-        <OffthreadVideo src={finalUrl} style={getMediaStyle(element.size)} muted />
+        <OffthreadVideo src={finalUrl as string} style={getMediaStyle(element.size)} muted />
       )}
       
       {(element.type === 'video' || element.type === 'image') && !isVideoFile && (
-        <img src={finalUrl} style={getMediaStyle(element.size)} alt="Prop" />
+        <img src={finalUrl as string} style={getMediaStyle(element.size)} alt="Prop" />
       )}
 
       {element.type === 'ruler' && (
@@ -232,7 +238,7 @@ const HudOverlay: React.FC<{
   });
 
   const hudMediaUrl = resolveMedia(topic.mediaUrl, defaultVideo);
-  const isHudVideo = typeof hudMediaUrl === 'string' && (hudMediaUrl.toLowerCase().endsWith('.mp4') || hudMediaUrl.toLowerCase().endsWith('.webm') || hudMediaUrl.includes('supabase.co'));
+  const isHudVideo = isVideoFormat(hudMediaUrl);
   
   const titleStyle: React.CSSProperties = format === 'portrait' ? {
     position: 'absolute', bottom: 130, left: '50%', transform: 'translateX(-50%)',
@@ -603,7 +609,7 @@ export const MyComposition: React.FC<MyCompositionProps> = (props) => {
             const nodeTitle = topicNodes[i]?.title || fallbackChar.name;
             const nodeImg = resolveMedia(topicNodes[i]?.mediaUrl, fallbackChar.img);
             
-            const isNodeVideo = typeof nodeImg === 'string' && (nodeImg.toLowerCase().endsWith('.mp4') || nodeImg.toLowerCase().endsWith('.webm') || nodeImg.includes('supabase.co'));
+            const isNodeVideo = isVideoFormat(nodeImg);
 
             const delay = i * 3;
             const entrance = spring({

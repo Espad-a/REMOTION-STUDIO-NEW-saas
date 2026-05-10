@@ -1,12 +1,12 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
-import { renderMediaOnLambda, renderStillOnLambda, getRenderProgress, deleteRender, deploySite } from '@remotion/lambda';
-import { S3Client, ListObjectsV2Command, GetObjectCommand, PutObjectCommand, DeleteObjectsCommand } from '@aws-sdk/client-s3';
+import { renderMediaOnLambda, renderStillOnLambda, getRenderProgress, deleteRender } from '@remotion/lambda';
+import { S3Client, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import path from 'path';
 import fs from 'fs';
 import * as DDG from 'duck-duck-scrape';
-import { execFile } from 'child_process';
+import { execFile, exec } from 'child_process';
 import util from 'util';
 import dotenv from 'dotenv';
 import * as mm from 'music-metadata';
@@ -15,6 +15,7 @@ import { createClient } from '@supabase/supabase-js';
 dotenv.config();
 
 const execFilePromise = util.promisify(execFile);
+const execPromise = util.promisify(exec);
 
 const app = express();
 const port = 3001;
@@ -30,6 +31,32 @@ app.use('/out', express.static(path.resolve('./out')));
 const supabaseUrl = process.env.VITE_SUPABASE_URL || '';
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey);
+
+// Helper function to upload dynamic media to Supabase
+const uploadFileToCloud = async (localPath: string, filename: string): Promise<string> => {
+  const fileBuffer = fs.readFileSync(localPath);
+  let contentType = 'application/octet-stream';
+  if (filename.endsWith('.mp4')) contentType = 'video/mp4';
+  else if (filename.endsWith('.mp3')) contentType = 'audio/mpeg';
+  else if (filename.endsWith('.wav')) contentType = 'audio/wav';
+  else if (filename.endsWith('.jpg') || filename.endsWith('.jpeg')) contentType = 'image/jpeg';
+  else if (filename.endsWith('.png')) contentType = 'image/png';
+
+  const { error } = await supabaseAdmin.storage
+    .from('user_assets')
+    .upload(`dynamic/${filename}`, fileBuffer, {
+      upsert: true,
+      contentType
+    });
+
+  if (error) {
+    console.error("Supabase upload error:", error);
+    throw error;
+  }
+
+  const { data } = supabaseAdmin.storage.from('user_assets').getPublicUrl(`dynamic/${filename}`);
+  return data.publicUrl;
+};
 
 // Supabase Auth Middleware (Required)
 const requireAuth = async (req: Request, res: Response, next: NextFunction) => {
@@ -94,7 +121,7 @@ if (!fs.existsSync(presetsDir)) fs.mkdirSync(presetsDir);
 const delayFn = (ms: number) => new Promise(res => setTimeout(res, ms));
 
 const cleanPublicAssets = () => {
-  console.log(`\n🧹 Auto-cleanup: Sweeping local public folder...`);
+  console.log(`\n🧹 Auto-cleanup: Sweeping public folder...`);
   const publicDir = path.resolve('./public');
   if (!fs.existsSync(publicDir)) return;
   
@@ -111,96 +138,24 @@ const cleanPublicAssets = () => {
     }
   }
   if (deletedCount > 0) {
-    console.log(`🧹 Deleted ${deletedCount} temporary media files from local drive.`);
+    console.log(`🧹 Deleted ${deletedCount} temporary media files to save space.`);
   }
 };
 
-// ==========================================
-// 14-DAY AWS S3 AUTO-CLEANUP ROUTINE
-// ==========================================
-const cleanOldS3Assets = async (region: string, bucketName: string) => {
-  try {
-    console.log(`\n☁️ Running 14-day auto-cleanup routine for S3 dynamic-assets...`);
-    const s3Client = new S3Client({ region });
-    
-    // Fetch all files in the dynamic-assets folder
-    const command = new ListObjectsV2Command({ Bucket: bucketName, Prefix: 'dynamic-assets/' });
-    const response = await s3Client.send(command);
-    
-    if (!response.Contents || response.Contents.length === 0) {
-      console.log(`☁️ S3 Bucket dynamic-assets folder is empty.`);
-      return;
-    }
-    
-    const now = Date.now();
-    const fourteenDaysMs = 14 * 24 * 60 * 60 * 1000;
-    
-    // Filter files older than 14 days
-    const keysToDelete = response.Contents
-      .filter(obj => obj.LastModified && (now - obj.LastModified.getTime() > fourteenDaysMs))
-      .map(obj => obj.Key as string);
-      
-    if (keysToDelete.length > 0) {
-      // AWS allows a max of 1000 deletions per request, so we chunk it just in case
-      for (let i = 0; i < keysToDelete.length; i += 1000) {
-         const chunk = keysToDelete.slice(i, i + 1000);
-         await s3Client.send(new DeleteObjectsCommand({
-            Bucket: bucketName,
-            Delete: { Objects: chunk.map(Key => ({ Key })) }
-         }));
-      }
-      console.log(`☁️ Successfully deleted ${keysToDelete.length} expired S3 assets (older than 14 days). Storage saved!`);
-    } else {
-      console.log(`☁️ No expired S3 assets found. Files will be kept for conversions.`);
-    }
-  } catch (e) {
-    console.error(`❌ Failed to run S3 14-day cleanup:`, e);
-  }
-};
-
-const getS3KeyFromUrl = (urlStr: string) => {
+const extractS3Key = (urlStr: string, bucketName?: string) => {
   try {
     const urlObj = new URL(urlStr);
     let key = urlObj.pathname.startsWith('/') ? urlObj.pathname.substring(1) : urlObj.pathname;
+    
+    if (bucketName && key.startsWith(`${bucketName}/`)) {
+      key = key.substring(bucketName.length + 1);
+    }
     return decodeURIComponent(key);
   } catch {
     return null;
   }
 };
 
-// Helper to deeply traverse an object and refresh any expired AWS presigned URLs
-const refreshPresignedUrls = async (obj: any, s3Client: S3Client, bucketName: string): Promise<any> => {
-  if (!obj) return obj;
-  if (typeof obj === 'string') {
-    if (obj.includes('amazonaws.com') && obj.includes('X-Amz-Signature')) {
-      const key = getS3KeyFromUrl(obj);
-      if (key) {
-        try {
-          const command = new GetObjectCommand({ Bucket: bucketName, Key: key });
-          return await getSignedUrl(s3Client, command, { expiresIn: 21600 });
-        } catch (e) {
-          return obj;
-        }
-      }
-    }
-    return obj;
-  }
-  if (Array.isArray(obj)) {
-    const arr = [];
-    for (let i = 0; i < obj.length; i++) {
-      arr[i] = await refreshPresignedUrls(obj[i], s3Client, bucketName);
-    }
-    return arr;
-  }
-  if (typeof obj === 'object') {
-    const newObj: any = {};
-    for (const key of Object.keys(obj)) {
-      newObj[key] = await refreshPresignedUrls(obj[key], s3Client, bucketName);
-    }
-    return newObj;
-  }
-  return obj;
-};
 
 app.post('/api/render', requireAuth, async (req, res) => {
   console.log(`\n========================================`);
@@ -213,85 +168,21 @@ app.post('/api/render', requireAuth, async (req, res) => {
   const inputProps = req.body;
   const userId = (req as any).user.sub;
   
-  let region = 'us-east-1';
-  let bucketName = '';
-  
   try {
     const functionName = process.env.REMOTION_FUNCTION_NAME;
     const serveUrl = process.env.REMOTION_SERVE_URL;
-    bucketName = process.env.REMOTION_BUCKET_NAME || '';
-    region = (process.env.REMOTION_AWS_REGION as any) || 'us-east-1';
-    
-    const framesPerLambda = parseInt(process.env.REMOTION_FRAMES_PER_LAMBDA || '900', 10);
+    const region = (process.env.REMOTION_AWS_REGION as any) || 'us-east-1';
 
-    if (!functionName || !serveUrl || !bucketName) {
-      throw new Error("Missing REMOTION_FUNCTION_NAME, REMOTION_SERVE_URL, or REMOTION_BUCKET_NAME in .env. Please run the deploy script first.");
+    if (!functionName || !serveUrl) {
+      throw new Error("Missing REMOTION_FUNCTION_NAME or REMOTION_SERVE_URL in .env. Please run the deploy script first.");
     }
 
-    const s3Client = new S3Client({ region });
-    const uploadedCache = new Map<string, string>();
-
-    const processMediaUrl = async (url: string) => {
-      if (!url || url === 'placeholder.mp4' || url.startsWith('http')) return url;
-      if (uploadedCache.has(url)) return uploadedCache.get(url)!;
-
-      const filePath = path.join(path.resolve('./public'), url);
-      if (!fs.existsSync(filePath)) return url;
-
-      let contentType = 'application/octet-stream';
-      if (url.endsWith('.mp3')) contentType = 'audio/mpeg';
-      else if (url.endsWith('.mp4')) contentType = 'video/mp4';
-      else if (url.endsWith('.webm')) contentType = 'video/webm';
-      else if (url.endsWith('.jpg') || url.endsWith('.jpeg')) contentType = 'image/jpeg';
-      else if (url.endsWith('.png')) contentType = 'image/png';
-      else if (url.endsWith('.wav')) contentType = 'audio/wav';
-
-      const fileBuffer = fs.readFileSync(filePath);
-      const key = `dynamic-assets/${Date.now()}_${url}`;
-      
-      console.log(`📤 Uploading local asset to S3 for Lambda access: ${url}`);
-      await s3Client.send(new PutObjectCommand({
-         Bucket: bucketName,
-         Key: key,
-         Body: fileBuffer,
-         ContentType: contentType
-      }));
-      
-      const command = new GetObjectCommand({ Bucket: bucketName, Key: key });
-      const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 21600 });
-      uploadedCache.set(url, signedUrl);
-      return signedUrl;
-    };
-
-    res.write(JSON.stringify({ type: 'info', message: 'Uploading dynamic assets to S3...' }) + '\n');
-    
-    if (inputProps.defaultVideo) {
-      inputProps.defaultVideo = await processMediaUrl(inputProps.defaultVideo);
-    }
-    if (inputProps.topicNodes) {
-      for (const node of inputProps.topicNodes) {
-        if (node.mediaUrl) node.mediaUrl = await processMediaUrl(node.mediaUrl);
-        if (node.audioUrl) node.audioUrl = await processMediaUrl(node.audioUrl);
-        if (node.titleAudioUrl) node.titleAudioUrl = await processMediaUrl(node.titleAudioUrl);
-      }
-    }
-    if (inputProps.topicCuts) {
-      for (const key of Object.keys(inputProps.topicCuts)) {
-        for (const cut of inputProps.topicCuts[key]) {
-          if (cut.mediaUrl) cut.mediaUrl = await processMediaUrl(cut.mediaUrl);
-        }
-      }
-    }
-    if (inputProps.elements) {
-      for (const el of inputProps.elements) {
-        if (el.url) el.url = await processMediaUrl(el.url);
-      }
-    }
-
-    console.log(`🎬 Starting Remotion render on AWS Lambda (framesPerLambda: ${framesPerLambda})...`);
+    console.log(`🎬 Starting Remotion render on AWS Lambda...`);
     res.write(JSON.stringify({ type: 'info', message: 'Triggering AWS Lambda render...' }) + '\n');
 
-    const { renderId } = await renderMediaOnLambda({
+    const fpl = parseInt(process.env.FRAMES_PER_LAMBDA || '900', 10);
+
+    const { renderId, bucketName } = await renderMediaOnLambda({
       region,
       functionName,
       serveUrl,
@@ -299,11 +190,23 @@ app.post('/api/render', requireAuth, async (req, res) => {
       inputProps,
       codec: 'h264',
       privacy: 'public', 
-      framesPerLambda,
+      framesPerLambda: fpl, 
     });
 
     console.log(`λ Lambda Job Started: ${renderId}`);
     res.write(JSON.stringify({ type: 'info', message: `Lambda Render Started: ${renderId}` }) + '\n');
+
+    // Save the inputProps to Supabase Storage so we can convert it later!
+    try {
+      const configPath = `dynamic/config_${renderId}.json`;
+      await supabaseAdmin.storage.from('user_assets').upload(configPath, JSON.stringify(inputProps), {
+        upsert: true,
+        contentType: 'application/json'
+      });
+      console.log(`💾 Saved render config to Cloud Storage (${configPath})`);
+    } catch (err: any) {
+      console.error(`⚠️ Failed to save render config:`, err.message);
+    }
 
     await supabaseAdmin.from('video_exports').upsert({
       id: renderId,
@@ -360,18 +263,6 @@ app.post('/api/render', requireAuth, async (req, res) => {
     const safeTitle = (inputProps.text || 'video').replace(/[^a-zA-Z0-9]/g, '_').toLowerCase().substring(0, 30);
     const jobFolderName = `${safeTitle}_${timestamp}`;
 
-    console.log(`📝 Saving input.json config to S3...`);
-    try {
-      await s3Client.send(new PutObjectCommand({
-         Bucket: bucketName,
-         Key: `renders/${renderId}/input.json`,
-         Body: JSON.stringify(inputProps),
-         ContentType: 'application/json'
-      }));
-    } catch(e) {
-      console.error("Failed to save input.json", e);
-    }
-
     await supabaseAdmin.from('video_exports').upsert({
       id: renderId,
       user_id: userId,
@@ -390,115 +281,16 @@ app.post('/api/render', requireAuth, async (req, res) => {
     }) + '\n');
     res.end();
 
+    setTimeout(() => cleanPublicAssets(), 2000);
+
   } catch (error: any) {
     console.error('\n❌ Render failed:', error);
     res.write(JSON.stringify({ type: 'error', error: error.message }) + '\n');
     res.end();
-  } finally {
-    // RUN CLEANUPS ASYNCHRONOUSLY AFTER RENDER
-    setTimeout(() => {
-      cleanPublicAssets();
-      if (bucketName) {
-        cleanOldS3Assets(region, bucketName);
-      }
-    }, 2000);
+    setTimeout(() => cleanPublicAssets(), 2000);
   }
 });
 
-// VERIFY ADMIN PIN ENDPOINT
-app.post('/api/admin/verify-pin', requireAuth, (req, res) => {
-  const { pin } = req.body;
-  const validPin = process.env.ADMIN_PIN || '1234';
-  
-  if (pin === validPin) {
-    res.json({ success: true });
-  } else {
-    res.status(401).json({ success: false, error: 'Invalid PIN' });
-  }
-});
-
-// ADMIN CONFIG ENDPOINTS
-app.post('/api/admin/config', requireAuth, async (req, res) => {
-  try {
-    const { pin, framesPerLambda } = req.body;
-    const validPin = process.env.ADMIN_PIN || '1234';
-    
-    if (pin !== validPin) {
-      return res.status(403).json({ error: "Invalid Admin PIN provided." });
-    }
-
-    const envPath = path.resolve('./.env');
-    let envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf-8') : '';
-    
-    const regex = new RegExp(`^REMOTION_FRAMES_PER_LAMBDA=.*$`, 'm');
-    if (regex.test(envContent)) {
-      envContent = envContent.replace(regex, `REMOTION_FRAMES_PER_LAMBDA=${framesPerLambda}`);
-    } else {
-      envContent += `\nREMOTION_FRAMES_PER_LAMBDA=${framesPerLambda}`;
-    }
-    
-    fs.writeFileSync(envPath, envContent.trim() + '\n');
-    process.env.REMOTION_FRAMES_PER_LAMBDA = framesPerLambda;
-    
-    res.json({ success: true });
-  } catch (error: any) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.get('/api/admin/config', requireAuth, (req, res) => {
-  res.json({ 
-    success: true, 
-    framesPerLambda: process.env.REMOTION_FRAMES_PER_LAMBDA || '900' 
-  });
-});
-
-// DEPLOY SITE TO AWS LAMBDA ROUTE
-app.post('/api/admin/deploy-site', requireAuth, async (req, res) => {
-  try {
-    const { pin } = req.body;
-    const validPin = process.env.ADMIN_PIN || '1234';
-    
-    if (pin !== validPin) {
-      return res.status(403).json({ error: "Invalid Admin PIN provided." });
-    }
-
-    const bucketName = process.env.REMOTION_BUCKET_NAME;
-    const region = (process.env.REMOTION_AWS_REGION as any) || 'us-east-1';
-    
-    if (!bucketName) {
-      throw new Error("Missing REMOTION_BUCKET_NAME in .env file. Please configure AWS first.");
-    }
-    
-    console.log(`📦 Deploying updated Remotion site to S3 (${bucketName})...`);
-    
-    const { serveUrl } = await deploySite({
-      entryPoint: path.resolve('./src/remotion/index.ts'),
-      bucketName,
-      region,
-    });
-    
-    console.log(`✅ Site deployed to: ${serveUrl}`);
-    
-    const envPath = path.resolve('./.env');
-    let envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf-8') : '';
-    const regex = new RegExp(`^REMOTION_SERVE_URL=.*$`, 'm');
-    
-    if (regex.test(envContent)) {
-      envContent = envContent.replace(regex, `REMOTION_SERVE_URL=${serveUrl}`);
-    } else {
-      envContent += `\nREMOTION_SERVE_URL=${serveUrl}`;
-    }
-    
-    fs.writeFileSync(envPath, envContent.trim() + '\n');
-    process.env.REMOTION_SERVE_URL = serveUrl;
-    
-    res.json({ success: true, serveUrl });
-  } catch (error: any) {
-    console.error("Deploy Error:", error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
 
 // Template API
 app.post('/api/templates', requireAuth, async (req, res) => {
@@ -588,6 +380,7 @@ app.get('/api/templates/:name', optionalAuth, async (req, res) => {
   res.status(404).json({ error: 'Template not found' });
 });
 
+
 // Presets API
 app.post('/api/presets', requireAuth, async (req, res) => {
   const { name, config } = req.body;
@@ -676,23 +469,86 @@ app.get('/api/presets/:name', optionalAuth, async (req, res) => {
   res.status(404).json({ error: 'Preset not found' });
 });
 
+
+// ==========================================
+// Admin Configuration API (PIN Protected)
+// ==========================================
+
+app.post('/api/admin/verify-pin', requireAuth, (req, res) => {
+  const { pin } = req.body;
+  const expectedPin = process.env.ADMIN_PIN || '1234';
+  if (pin === expectedPin) {
+    res.json({ success: true });
+  } else {
+    res.status(403).json({ success: false, error: 'Invalid PIN' });
+  }
+});
+
+app.get('/api/admin/config', requireAuth, (req, res) => {
+  res.json({ success: true, framesPerLambda: process.env.FRAMES_PER_LAMBDA || '900' });
+});
+
+app.post('/api/admin/config', requireAuth, (req, res) => {
+  const { pin, framesPerLambda } = req.body;
+  const expectedPin = process.env.ADMIN_PIN || '1234';
+  if (pin !== expectedPin) return res.status(403).json({ error: 'Invalid PIN' });
+  
+  const envPath = path.resolve('./.env');
+  let envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf-8') : '';
+  const regex = /^FRAMES_PER_LAMBDA=.*$/m;
+  if (regex.test(envContent)) {
+    envContent = envContent.replace(regex, `FRAMES_PER_LAMBDA=${framesPerLambda}`);
+  } else {
+    envContent += `\nFRAMES_PER_LAMBDA=${framesPerLambda}`;
+  }
+  fs.writeFileSync(envPath, envContent.trim() + '\n');
+  process.env.FRAMES_PER_LAMBDA = framesPerLambda;
+  
+  res.json({ success: true });
+});
+
+app.post('/api/admin/deploy-site', requireAuth, async (req, res) => {
+  const { pin } = req.body;
+  const expectedPin = process.env.ADMIN_PIN || '1234';
+  if (pin !== expectedPin) return res.status(403).json({ error: 'Invalid PIN' });
+  
+  try {
+    const { stdout } = await execPromise('npx tsx scripts/deploy-lambda.ts');
+    console.log("Deploy success:", stdout);
+    
+    dotenv.config({ override: true });
+    
+    res.json({ success: true, logs: stdout });
+  } catch (err: any) {
+    console.error("Deploy error:", err);
+    res.status(500).json({ error: err.message, logs: err.stdout });
+  }
+});
+
+
 // Voice API
 app.post('/api/elevenlabs/generate', async (req, res) => {
   try {
     const { text, voiceId, index } = req.body;
     const keyToUse = process.env.ELEVENLABS_API_KEY || process.env.VITE_ELEVENLABS_API_KEY;
     if (!text || !keyToUse || !voiceId) return res.status(400).json({ error: 'Missing parameters or Server API Key' });
+    
     const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
       method: 'POST',
       headers: { 'Accept': 'audio/mpeg', 'Content-Type': 'application/json', 'xi-api-key': keyToUse },
       body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.75 } })
     });
     if (!response.ok) throw new Error('ElevenLabs API Error');
+    
     const arrayBuffer = await response.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
     const filename = `voice_${index}_${Date.now()}.mp3`;
-    fs.writeFileSync(path.join(path.resolve('./public'), filename), buffer);
-    res.json({ success: true, filename });
+    const filePath = path.join(path.resolve('./public'), filename);
+    
+    fs.writeFileSync(filePath, buffer);
+    const publicUrl = await uploadFileToCloud(filePath, filename);
+    
+    res.json({ success: true, filename: publicUrl, localFilename: filename });
   } catch (error: any) { res.status(500).json({ success: false, error: error.message }); }
 });
 
@@ -720,8 +576,12 @@ app.post('/api/kokoro/generate', async (req, res) => {
       audioBuffer = Buffer.concat(buffers);
     }
     const filename = `voice_${index}_${Date.now()}.wav`;
-    fs.writeFileSync(path.join(path.resolve('./public'), filename), audioBuffer);
-    res.json({ success: true, filename });
+    const filePath = path.join(path.resolve('./public'), filename);
+    
+    fs.writeFileSync(filePath, audioBuffer);
+    const publicUrl = await uploadFileToCloud(filePath, filename);
+    
+    res.json({ success: true, filename: publicUrl, localFilename: filename });
   } catch (error: any) { res.status(500).json({ success: false, error: error.message }); }
 });
 
@@ -738,8 +598,12 @@ app.post('/api/testing/generate', async (req, res) => {
     }
     const audioBuffer = Buffer.concat(buffers);
     const filename = `voice_${index}_${Date.now()}.mp3`;
-    fs.writeFileSync(path.join(path.resolve('./public'), filename), audioBuffer);
-    res.json({ success: true, filename });
+    const filePath = path.join(path.resolve('./public'), filename);
+    
+    fs.writeFileSync(filePath, audioBuffer);
+    const publicUrl = await uploadFileToCloud(filePath, filename);
+    
+    res.json({ success: true, filename: publicUrl, localFilename: filename });
   } catch (error: any) { res.status(500).json({ success: false, error: error.message }); }
 });
 
@@ -803,11 +667,15 @@ app.post('/api/media/download', async (req, res) => {
     const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
     if (!response.ok) throw new Error(`Failed to download: ${response.statusText}`);
     if ((response.headers.get('content-type') || '').includes('text/html')) throw new Error("HTML web page rejected");
+    
     const arrayBuffer = await response.arrayBuffer();
     const filePath = path.join(path.resolve('./public'), filename);
+    
     fs.writeFileSync(filePath, Buffer.from(arrayBuffer));
     if (fs.statSync(filePath).size < 5000) { fs.unlinkSync(filePath); throw new Error("File too small"); }
-    res.json({ success: true, filename });
+    
+    const publicUrl = await uploadFileToCloud(filePath, filename);
+    res.json({ success: true, filename: publicUrl, localFilename: filename });
   } catch (error: any) { res.status(500).json({ success: false, error: error.message }); }
 });
 
@@ -815,34 +683,24 @@ app.post('/api/media/download-youtube', async (req, res) => {
   try {
     const { url, filename, durationSecs } = req.body;
     if (!url || !filename) return res.status(400).json({ error: 'url and filename required' });
+    
     const publicDir = path.resolve('./public');
     const outputPath = path.join(publicDir, filename);
-    
-    let downloaderPath = 'yt-dlp';
-    let hasFfmpeg = false;
-    let useBinDir = false;
-    
     const binDir = path.resolve('./bin');
-    if (fs.existsSync(binDir)) {
-      const files = fs.readdirSync(binDir);
-      const downloaderFile = files.find(f => f.toLowerCase().includes('yt-dlp') || f.toLowerCase().includes('youtube-dl'));
-      if (downloaderFile) {
-        downloaderPath = path.join(binDir, downloaderFile);
-        useBinDir = true;
-      }
-    }
+    if (!fs.existsSync(binDir)) throw new Error('bin folder not found');
+    
+    const files = fs.readdirSync(binDir);
+    const downloaderFile = files.find(f => f.toLowerCase().includes('yt-dlp') || f.toLowerCase().includes('youtube-dl')) || files[0];
+    if (!downloaderFile) throw new Error('No yt-dlp executable found in bin folder');
+    const downloaderPath = path.join(binDir, downloaderFile);
 
-    try { 
-      await execFilePromise('ffmpeg', ['-version']); 
-      hasFfmpeg = true; 
-    } catch (e) {
-      if (useBinDir && fs.readdirSync(binDir).some(f => f.toLowerCase().includes('ffmpeg'))) {
-        hasFfmpeg = true;
-      }
+    let hasFfmpeg = files.some(f => f.toLowerCase().includes('ffmpeg'));
+    if (!hasFfmpeg) {
+      try { await execFilePromise('ffmpeg', ['-version']); hasFfmpeg = true; } catch (e) {}
     }
 
     const args = ['--no-playlist', '-o', outputPath];
-    if (hasFfmpeg && useBinDir) args.push('--ffmpeg-location', binDir);
+    if (hasFfmpeg) args.push('--ffmpeg-location', binDir);
 
     if (durationSecs) {
       if (!hasFfmpeg) throw new Error("FFmpeg missing. Required for slicing.");
@@ -853,20 +711,15 @@ app.post('/api/media/download-youtube', async (req, res) => {
     }
     args.push(url);
 
-    try {
-      await execFilePromise(downloaderPath, args);
-    } catch (err: any) {
-      if (!useBinDir) {
-         throw new Error(`Failed to execute system yt-dlp. Make sure it is installed on the server (e.g. 'pip install yt-dlp') or placed in the bin/ folder.`);
-      }
-      throw err;
-    }
-    
+    await execFilePromise(downloaderPath, args);
     if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size < 5000) throw new Error('Download missing or corrupt');
-    res.json({ success: true, filename });
+    
+    const publicUrl = await uploadFileToCloud(outputPath, filename);
+    res.json({ success: true, filename: publicUrl, localFilename: filename });
   } catch (error: any) { res.status(500).json({ success: false, error: error.message }); }
 });
 
+// PRESIGN MULTIPLE S3 URLS
 app.post('/api/renders/presign', requireAuth, async (req, res) => {
   try {
     const { keys } = req.body;
@@ -883,16 +736,19 @@ app.post('/api/renders/presign', requireAuth, async (req, res) => {
     await Promise.all(keys.map(async (urlOrKey: string) => {
       if (!urlOrKey) return;
       let key = urlOrKey;
+      
       if (key.startsWith('http')) {
-         key = getS3KeyFromUrl(key) || key;
+         key = extractS3Key(key, bucketName) || key;
       }
+      
       if (key.startsWith('http')) {
          urlMap[urlOrKey] = urlOrKey;
          return;
       }
+      
       try {
         const command = new GetObjectCommand({ Bucket: bucketName, Key: key });
-        urlMap[urlOrKey] = await getSignedUrl(s3Client, command, { expiresIn: 21600 });
+        urlMap[urlOrKey] = await getSignedUrl(s3Client, command, { expiresIn: 21600 }); // 6 hours
       } catch(e) {
         urlMap[urlOrKey] = urlOrKey;
       }
@@ -904,6 +760,106 @@ app.post('/api/renders/presign', requireAuth, async (req, res) => {
   }
 });
 
+// FORMAT CONVERSION ENDPOINT
+app.post('/api/renders/:id/convert', requireAuth, async (req, res) => {
+  try {
+    const renderId = req.params.id;
+    const userId = (req as any).user.sub;
+
+    // Fetch the original config that we now save inside /api/render
+    const configPath = `dynamic/config_${renderId}.json`;
+    const { data, error } = await supabaseAdmin.storage.from('user_assets').download(configPath);
+    
+    if (error || !data) {
+      throw new Error("Original video config not found. Only newly exported videos can be converted.");
+    }
+
+    const inputProps = JSON.parse(await data.text());
+
+    // Toggle format
+    inputProps.format = inputProps.format === 'landscape' ? 'portrait' : 'landscape';
+
+    // Kick off a headless job to re-render without re-running AI
+    const newJobId = `job_conv_${Date.now()}`;
+    jobs.set(newJobId, {
+      id: newJobId,
+      status: 'queued',
+      progress: 0,
+      step: 'Initializing Format Conversion',
+      logs: [],
+    });
+
+    res.json({ success: true, message: `Conversion to ${inputProps.format} started! View progress in Dashboard.` });
+
+    // Run the conversion async
+    (async () => {
+      const job = jobs.get(newJobId)!;
+      try {
+        job.status = 'running';
+        job.progress = 10;
+        job.step = 'Rendering Video on AWS Lambda';
+        
+        job.logs.push({ time: new Date().toLocaleTimeString(), msg: `Starting conversion to ${inputProps.format}...`, type: 'info' });
+
+        const renderRes = await fetch(`http://localhost:${port}/api/render`, {
+          method: 'POST', 
+          headers: { 
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer internal_job_token`,
+            'x-user-id': userId
+          }, 
+          body: JSON.stringify(inputProps)
+        });
+
+        if (!renderRes.body) throw new Error("Lambda render failed to return a response stream.");
+
+        const reader = renderRes.body.getReader();
+        const decoder = new TextDecoder();
+        let done = false; let buffer = '';
+        while (!done) {
+          const { value, done: readerDone } = await reader.read();
+          done = readerDone;
+          if (value) {
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              try {
+                const data = JSON.parse(line);
+                if (data.type === 'info') {
+                  job.logs.push({ time: new Date().toLocaleTimeString(), msg: data.message, type: 'info' });
+                }
+                else if (data.type === 'progress') {
+                  job.progress = 10 + Math.round(data.percent * 0.9);
+                } else if (data.type === 'done') {
+                  job.videoUrl = data.output; 
+                  job.thumbnailUrl = data.thumbnail; 
+                  job.progress = 100;
+                  job.status = 'completed';
+                  job.step = 'Finished Conversion';
+                  job.logs.push({ time: new Date().toLocaleTimeString(), msg: '🎉 Conversion Complete!', type: 'success' });
+                } else if (data.type === 'error') {
+                  throw new Error(data.error);
+                }
+              } catch (e: any) {}
+            }
+          }
+        }
+      } catch(e: any) {
+         job.status = 'failed';
+         job.error = e.message;
+         job.step = 'Error';
+         job.logs.push({ time: new Date().toLocaleTimeString(), msg: `❌ Conversion Failed: ${e.message}`, type: 'error' });
+      }
+    })();
+
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE RENDER FROM S3 & SUPABASE
 app.delete('/api/renders/:id', requireAuth, async (req, res) => {
   try {
     const bucketName = process.env.REMOTION_BUCKET_NAME;
@@ -936,6 +892,7 @@ app.delete('/api/renders/:id', requireAuth, async (req, res) => {
   }
 });
 
+// PRESIGNED DOWNLOAD URL ENDPOINT
 app.get('/api/renders/:id/download-url', async (req, res) => {
   try {
     const bucketName = process.env.REMOTION_BUCKET_NAME;
@@ -965,134 +922,6 @@ app.get('/api/renders/:id/download-url', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
-app.post('/api/renders/:id/convert', requireAuth, async (req, res) => {
-  try {
-    const renderId = req.params.id;
-    const userId = (req as any).user.sub;
-    const bucketName = process.env.REMOTION_BUCKET_NAME;
-    const region = (process.env.REMOTION_AWS_REGION as any) || 'us-east-1';
-    const functionName = process.env.REMOTION_FUNCTION_NAME;
-    const serveUrl = process.env.REMOTION_SERVE_URL;
-
-    const framesPerLambda = parseInt(process.env.REMOTION_FRAMES_PER_LAMBDA || '900', 10);
-
-    if (!bucketName || !functionName || !serveUrl) {
-      throw new Error("AWS Config missing. Deploy your site first.");
-    }
-
-    const s3Client = new S3Client({ region });
-    let inputProps;
-    
-    try {
-      const getObj = await s3Client.send(new GetObjectCommand({
-        Bucket: bucketName,
-        Key: `renders/${renderId}/input.json`
-      }));
-      const bodyString = await getObj.Body?.transformToString();
-      if (!bodyString) throw new Error("Empty body");
-      inputProps = JSON.parse(bodyString);
-    } catch(e) {
-      throw new Error("Could not find original input.json on AWS. This video might be too old to convert.");
-    }
-
-    // Refresh any expired presigned URLs before passing to Lambda
-    inputProps = await refreshPresignedUrls(inputProps, s3Client, bucketName);
-
-    const oldFormat = inputProps.format || 'landscape';
-    const newFormat = oldFormat === 'portrait' ? 'landscape' : 'portrait';
-    inputProps.format = newFormat;
-    
-    if (inputProps.cols && inputProps.rows) {
-       const temp = inputProps.cols;
-       inputProps.cols = inputProps.rows;
-       inputProps.rows = temp;
-    }
-
-    const newJobId = `job_convert_${Date.now()}`;
-    jobs.set(newJobId, { 
-      id: newJobId, status: 'queued', progress: 0, step: 'Initializing Conversion', logs: []
-    });
-    
-    res.json({ success: true, jobId: newJobId, newFormat, message: `Conversion to ${newFormat} started! Head to the Automation Dashboard to view its progress.` });
-    
-    (async () => {
-      const job = jobs.get(newJobId)!;
-      try {
-        job.status = 'running';
-        job.step = `Rendering ${newFormat} Video`;
-        job.progress = 10;
-        job.logs.push({ time: new Date().toLocaleTimeString(), msg: `Starting AWS Lambda render for ${newFormat}...`, type: 'info' });
-
-        const { renderId: newRenderId } = await renderMediaOnLambda({
-          region, functionName, serveUrl, composition: 'MyVideo',
-          inputProps, codec: 'h264', privacy: 'public', framesPerLambda
-        });
-
-        job.logs.push({ time: new Date().toLocaleTimeString(), msg: `Lambda Render Started: ${newRenderId}`, type: 'info' });
-
-        await supabaseAdmin.from('video_exports').upsert({
-          id: newRenderId, user_id: userId, title: `${inputProps.text || 'Video'} (${newFormat})`,
-          video_url: '', thumbnail_url: '', created_at: Date.now(), status: 'failed'
-        });
-
-        let renderDone = false;
-        let outputUrl = '';
-
-        while (!renderDone) {
-          await delayFn(2000);
-          const progress = await getRenderProgress({ renderId: newRenderId, bucketName, functionName, region });
-          if (progress.fatalErrorEncountered) throw new Error(progress.errors[0]?.message || 'Lambda render fatal error');
-          if (progress.done && progress.outputFile) {
-            renderDone = true; outputUrl = progress.outputFile;
-          } else {
-            job.progress = 10 + Math.round(progress.overallProgress * 80);
-          }
-        }
-
-        job.logs.push({ time: new Date().toLocaleTimeString(), msg: `Generating thumbnail...`, type: 'info' });
-        const { url: thumbnailUrl } = await renderStillOnLambda({
-          region, functionName, serveUrl, composition: 'MyVideo',
-          inputProps, frame: 59, imageFormat: 'jpeg', privacy: 'public'
-        });
-
-        await s3Client.send(new PutObjectCommand({
-           Bucket: bucketName, Key: `renders/${newRenderId}/input.json`,
-           Body: JSON.stringify(inputProps), ContentType: 'application/json'
-        }));
-
-        await supabaseAdmin.from('video_exports').upsert({
-          id: newRenderId, user_id: userId, title: `${inputProps.text || 'Video'} (${newFormat})`,
-          video_url: outputUrl, thumbnail_url: thumbnailUrl, created_at: Date.now(), status: 'completed'
-        });
-
-        job.progress = 100;
-        job.status = 'completed';
-        job.step = 'Finished';
-        job.videoUrl = outputUrl;
-        job.thumbnailUrl = thumbnailUrl;
-        job.logs.push({ time: new Date().toLocaleTimeString(), msg: `Conversion Complete!`, type: 'success' });
-
-      } catch(err:any) {
-        job.status = 'failed';
-        job.error = err.message;
-        job.step = 'Error';
-        job.logs.push({ time: new Date().toLocaleTimeString(), msg: `Conversion Failed: ${err.message}`, type: 'error' });
-      } finally {
-        setTimeout(() => {
-          cleanPublicAssets();
-          if (process.env.REMOTION_BUCKET_NAME) {
-            cleanOldS3Assets(process.env.REMOTION_AWS_REGION || 'us-east-1', process.env.REMOTION_BUCKET_NAME);
-          }
-        }, 2000);
-      }
-    })();
-
-  } catch (error: any) {
-     res.status(500).json({ success: false, error: error.message });
-  }
-});
-
 
 // =====================================
 // HEADLESS AUTOMATION PIPELINE (JOBS)
@@ -1127,9 +956,8 @@ const EXPLAINER_TOPICS = [
 
 const DEFAULT_PROMPT_OUTLINE = `You are a master YouTube documentary producer. Given a main topic and a desired number of segments, create a logical, engaging outline of sub-topics or characters to cover.
 Ensure there are EXACTLY the requested number of subtopics. Be highly specific with the subtopic names so the writer knows exactly what to cover.
-CRITICAL RULE: Keep the subtopic names VERY SHORT (maximum 2-4 words). Do not use long sentences. They must fit cleanly on screen as titles.
 OUTPUT EXACT JSON STRUCTURE:
-{ "subtopics": ["<Short Title 1>", "<Short Title 2>"] }`;
+{ "subtopics": ["<Specific Subtopic 1>", "<Specific Subtopic 2>"] }`;
 
 const DEFAULT_PROMPT_SEGMENT = `You are a script writer for a highly detailed, long-form YouTube documentary channel. You will be given a Main Topic and a specific Sub-topic to focus on for this segment.
 
@@ -1163,6 +991,7 @@ OUTPUT EXACT JSON STRUCTURE:
 const DEFAULT_PROMPT_1 = `You are an editor. Analyze the explainer transcript and output ONLY a valid JSON object. No markdown.\n\nYour job:\n1. Identify all main topics/characters being explained.\n2. Break down the text for each topic into DISTINCT, SHORT SENTENCES (or visual beats) into an array. Do not lump multiple visual ideas into one sentence. Each sentence will become a separate video cut.\n\nOUTPUT EXACT JSON STRUCTURE: \n{ "topics": [ { "label": "<Full Topic Name>", "sentences": ["<Sentence 1>", "<Sentence 2>", "<Sentence 3>"] } ] }`;
 const DEFAULT_PROMPT_2 = `You are a video layout director. You will receive a specific topic and its exact sentences. Output ONLY a valid JSON object. No markdown.\n\nYour job: For EVERY SINGLE SENTENCE provided, pick the best template from the SERVER TEMPLATES list to represent it visually. Do NOT generate search queries. Read the descriptions of the templates carefully to know when to use them!\n\nRULES:\n1. You MUST output exactly one moment per sentence provided.\n2. Estimate the duration for each sentence (~3 words = 1 second). Minimum 3s.\n3. If there are video templates (ones with 'vid' in the name), use them SPARINGLY (maximum ONCE per topic). Use image templates for the rest.\n\nOUTPUT EXACT JSON STRUCTURE: \n{ "label": "<Topic Name>", "moments": [ { "sentence_index": <number>, "template": "<Template Name>", "duration_estimate": <seconds> } ] }`;
 const DEFAULT_PROMPT_3 = `You are a media researcher. You will receive a specific topic and its exact sentences. Output ONLY a valid JSON object. No markdown.\n\nYour job: For EVERY SINGLE SENTENCE, generate a CLEAN, 3-5 word 'search_query' for finding an image or video that perfectly matches that sentence visually.\n\nRULES:\n1. The system searches DuckDuckGo. Do NOT use special characters, quotes, or parentheses.\n2. Do NOT use abstract concepts. Use concrete visual keywords (e.g., use "vintage 1950s computer lab" instead of "Early enthusiasm for machine solving").\n\nOUTPUT EXACT JSON STRUCTURE: \n{ "label": "<Topic Name>", "queries": [ { "sentence_index": <number>, "search_query": "<3-5 words>" } ] }`;
+
 
 async function callLLMServer(systemMessage: string, userMessage: string, provider: string, model: string, apiKey: string) {
   if (provider === 'anthropic') {
@@ -1207,29 +1036,30 @@ async function runJob(jobId: string, payload: any, userId: string) {
     let finalConfig = { ...payload };
 
     if (payload.preset) {
-      log(`📦 Loading preset config for: ${payload.preset}`);
+      log(`📦 Loading preset config: ${payload.preset}`);
       let presetData = null;
-
+      
+      // 1. Try to fetch from Supabase first
       let query = supabaseAdmin.from('presets').select('config').eq('name', payload.preset);
       if (userId) query = query.or(`is_global.eq.true,user_id.eq.${userId}`);
       else query = query.eq('is_global', true);
-
-      const { data } = await query.limit(1);
-      if (data && data.length > 0) {
+      
+      const { data, error } = await query.limit(1);
+      
+      if (!error && data && data.length > 0) {
         presetData = data[0].config;
-        log(`☁️ Loaded preset from Cloud Database.`);
       } else {
+        // 2. Fallback to local files if not in DB
         const presetPath = path.join(presetsDir, `${payload.preset}.json`);
         if (fs.existsSync(presetPath)) {
           presetData = JSON.parse(fs.readFileSync(presetPath, 'utf-8'));
-          log(`📁 Loaded preset from Local Filesystem.`);
         }
       }
 
       if (presetData) {
         finalConfig = { ...presetData, ...payload };
       } else {
-        throw new Error(`Preset "${payload.preset}" not found on server or cloud.`);
+        throw new Error(`Preset "${payload.preset}" not found in Cloud or Server.`);
       }
     }
 
@@ -1246,7 +1076,6 @@ async function runJob(jobId: string, payload: any, userId: string) {
       gridConfigs = {},
       defaultHudName = '',
       fontFamily = 'Bebas Neue',
-      format = 'landscape',
       webhookUrl = '',
       test = false
     } = finalConfig;
@@ -1258,6 +1087,7 @@ async function runJob(jobId: string, payload: any, userId: string) {
 
     const isTestMode = test === true || test === 'true';
 
+    // Using exclusively Server Environment Variables for API Keys
     const activeAiKey = process.env.GLOBAL_API_KEY || process.env.VITE_GLOBAL_API_KEY;
     const activeScriptKey = process.env.SCRIPT_API_KEY || process.env.VITE_SCRIPT_API_KEY || activeAiKey;
 
@@ -1289,6 +1119,7 @@ async function runJob(jobId: string, payload: any, userId: string) {
         topicCuts[i] = [];
       }
     } else {
+      // Step 1: Scripting
       job.step = 'Generating Script';
       log(`🎯 Topic Selected: ${mainTopic}`, 'info');
       
@@ -1316,28 +1147,19 @@ async function runJob(jobId: string, payload: any, userId: string) {
       fullScript += `category: ${mainTopic}`;
       log('✅ Script generation complete.', 'success');
 
+      // Step 2: Editor Pipeline
       job.step = 'Executing AI Director Pipeline';
       job.progress = 25;
       log('✂️ Extracting topics & splitting sentences...', 'info');
-      const step1Data = await callLLMServer(prompt1, `TRANSCRIPT:\n${fullScript}`, aiProvider, aiModel, activeAiKey as string);
+      
+      const step1Prompt = prompt1 + "\n\nCRITICAL RULE: The 'label' for each topic MUST be 1, 2, or 3 words maximum! Do not use long phrases.";
+      
+      const step1Data = await callLLMServer(step1Prompt, `TRANSCRIPT:\n${fullScript}`, aiProvider, aiModel, activeAiKey as string);
       const topics = step1Data.topics || [];
       if (topics.length === 0) throw new Error("AI found no topics.");
 
-      let tQuery = supabaseAdmin.from('templates').select('name, config');
-      if (userId) tQuery = tQuery.or(`is_global.eq.true,user_id.eq.${userId}`);
-      else tQuery = tQuery.eq('is_global', true);
-      
-      const { data: cloudTData } = await tQuery;
-      const cloudTemplates = (cloudTData || []).map(t => ({ name: t.name, ...t.config }));
-      
-      const templatesFiles = fs.existsSync(templatesDir) ? fs.readdirSync(templatesDir).filter(f => f.endsWith('.json')) : [];
-      const localTemplates = templatesFiles.map(f => ({ name: f.replace('.json',''), ...JSON.parse(fs.readFileSync(path.join(templatesDir, f), 'utf-8')) }));
-      
-      const tplMap = new Map();
-      localTemplates.forEach(t => tplMap.set(t.name, t));
-      cloudTemplates.forEach(t => tplMap.set(t.name, t));
-      const fullTemplates = Array.from(tplMap.values());
-
+      const templatesFiles = fs.readdirSync(templatesDir).filter(f => f.endsWith('.json'));
+      const fullTemplates = templatesFiles.map(f => ({ name: f.replace('.json',''), ...JSON.parse(fs.readFileSync(path.join(templatesDir, f), 'utf-8')) }));
       const cutTemplates = fullTemplates.filter(t => t.template === 'cut');
       const serverTemplatesList = cutTemplates.map(t => `- ${t.name}: ${t.description || 'General use'}`).join('\n');
 
@@ -1369,7 +1191,7 @@ async function runJob(jobId: string, payload: any, userId: string) {
             const dlData = await internalFetch(endpoint, reqBody);
             if (dlData.success) {
               usedMediaUrls.add(sourceUrl.split('?')[0]);
-              return dlData.filename;
+              return dlData.filename; // this is the publicUrl now
             }
           }
         } catch (e) {} return null;
@@ -1399,7 +1221,7 @@ async function runJob(jobId: string, payload: any, userId: string) {
         const titleTtsData = await internalFetch(`/api/${ttsProvider}/generate`, titleTtsPayload);
         if (titleTtsData.success) {
           titleAudioUrl = titleTtsData.filename;
-          const audioPath = path.join(path.resolve('./public'), titleAudioUrl);
+          const audioPath = path.join(path.resolve('./public'), titleTtsData.localFilename || titleTtsData.filename);
           try {
             const metadata = await mm.parseFile(audioPath);
             titleAudioDurationSecs = metadata.format.duration || (topic.label.split(' ').length / 2.5);
@@ -1418,7 +1240,7 @@ async function runJob(jobId: string, payload: any, userId: string) {
         const ttsData = await internalFetch(`/api/${ttsProvider}/generate`, ttsPayload);
         if (ttsData.success) {
           audioUrl = ttsData.filename;
-          const audioPath = path.join(path.resolve('./public'), audioUrl);
+          const audioPath = path.join(path.resolve('./public'), ttsData.localFilename || ttsData.filename);
           try {
             const metadata = await mm.parseFile(audioPath);
             audioDurationSecs = metadata.format.duration || (topicScript.split(' ').length / 2.5);
@@ -1491,38 +1313,13 @@ async function runJob(jobId: string, payload: any, userId: string) {
     
     let defaultHudConfig = { hudTitleColor: '#fff', hudProgressColor: '#ccc', hudShowTitle: true, hudShowImage: true, hudShowProgress: true, hudTitleShadow: true, hudImageShadow: true, hudProgressBarShadow: true };
     if (defaultHudName) {
-      // Re-fetch templates locally since we already built the fullTemplates list
-      let tQuery = supabaseAdmin.from('templates').select('name, config');
-      if (userId) tQuery = tQuery.or(`is_global.eq.true,user_id.eq.${userId}`);
-      else tQuery = tQuery.eq('is_global', true);
-      const { data: cloudTData } = await tQuery;
-      const cloudTemplates = (cloudTData || []).map(t => ({ name: t.name, ...t.config }));
-      
-      const templatesFiles = fs.existsSync(templatesDir) ? fs.readdirSync(templatesDir).filter(f => f.endsWith('.json')) : [];
-      const localTemplates = templatesFiles.map(f => ({ name: f.replace('.json',''), ...JSON.parse(fs.readFileSync(path.join(templatesDir, f), 'utf-8')) }));
-      
-      const tplMap = new Map();
-      localTemplates.forEach(t => tplMap.set(t.name, t));
-      cloudTemplates.forEach(t => tplMap.set(t.name, t));
-      const fullTemplates = Array.from(tplMap.values());
-
-      const activeHud = fullTemplates.find(t => t.name === defaultHudName);
-      if (activeHud) defaultHudConfig = { ...defaultHudConfig, ...activeHud };
+      const hudPath = path.join(templatesDir, `${defaultHudName}.json`);
+      if (fs.existsSync(hudPath)) {
+        defaultHudConfig = { ...defaultHudConfig, ...JSON.parse(fs.readFileSync(hudPath, 'utf-8')) };
+      }
     } else {
-      let tQuery = supabaseAdmin.from('templates').select('name, config');
-      if (userId) tQuery = tQuery.or(`is_global.eq.true,user_id.eq.${userId}`);
-      else tQuery = tQuery.eq('is_global', true);
-      const { data: cloudTData } = await tQuery;
-      const cloudTemplates = (cloudTData || []).map(t => ({ name: t.name, ...t.config }));
-      
-      const templatesFiles = fs.existsSync(templatesDir) ? fs.readdirSync(templatesDir).filter(f => f.endsWith('.json')) : [];
-      const localTemplates = templatesFiles.map(f => ({ name: f.replace('.json',''), ...JSON.parse(fs.readFileSync(path.join(templatesDir, f), 'utf-8')) }));
-      
-      const tplMap = new Map();
-      localTemplates.forEach(t => tplMap.set(t.name, t));
-      cloudTemplates.forEach(t => tplMap.set(t.name, t));
-      const fullTemplates = Array.from(tplMap.values());
-
+      const templatesFiles = fs.readdirSync(templatesDir).filter(f => f.endsWith('.json'));
+      const fullTemplates = templatesFiles.map(f => ({ name: f.replace('.json',''), ...JSON.parse(fs.readFileSync(path.join(templatesDir, f), 'utf-8')) }));
       const hudTpl = fullTemplates.find(t => t.template === 'hud');
       if (hudTpl) defaultHudConfig = { ...defaultHudConfig, ...hudTpl };
     }
@@ -1531,7 +1328,6 @@ async function runJob(jobId: string, payload: any, userId: string) {
       ...defaultHudConfig,
       text: mainTopic, 
       template: 'explainer',
-      format,
       circleCount: activeCount, 
       fontFamily,
       hSpacing: gridConfig.hSpacing, 
@@ -1624,13 +1420,7 @@ async function runJob(jobId: string, payload: any, userId: string) {
     log(`❌ Automation Failed: ${error.message}`, 'error');
     if (job.webhookUrl) job.webhookStatus = 'failed';
   } finally {
-    // RUN CLEANUPS ASYNCHRONOUSLY AFTER RENDER
-    setTimeout(() => {
-      cleanPublicAssets();
-      if (process.env.REMOTION_BUCKET_NAME) {
-        cleanOldS3Assets(process.env.REMOTION_AWS_REGION || 'us-east-1', process.env.REMOTION_BUCKET_NAME);
-      }
-    }, 2000);
+    setTimeout(() => cleanPublicAssets(), 2000);
   }
 }
 
@@ -1691,17 +1481,5 @@ app.post('/api/test-webhook', async (req, res) => {
   }
 });
 
-const distPath = path.resolve('./dist');
-if (fs.existsSync(distPath)) {
-  app.use(express.static(distPath));
-  
-  app.use((req, res, next) => {
-    if (req.method === 'GET' && !req.path.startsWith('/api')) {
-      res.sendFile(path.join(distPath, 'index.html'));
-    } else {
-      next();
-    }
-  });
-}
 
 app.listen(port, () => console.log(`Server running at http://localhost:3001`));

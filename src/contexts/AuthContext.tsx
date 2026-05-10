@@ -27,10 +27,12 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
         .from('profiles')
         .select('credits')
         .eq('id', userId)
-        .single();
+        .maybeSingle();
         
       if (!error && data) {
         setCredits(data.credits || 0);
+      } else {
+        setCredits(0);
       }
     } catch (err) {
       console.error("Error fetching credits:", err);
