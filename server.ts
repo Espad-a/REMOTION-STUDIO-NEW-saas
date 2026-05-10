@@ -11,6 +11,7 @@ import util from 'util';
 import dotenv from 'dotenv';
 import * as mm from 'music-metadata';
 import { createClient } from '@supabase/supabase-js';
+import ws from 'ws';
 
 dotenv.config();
 
@@ -30,7 +31,7 @@ app.use('/out', express.static(path.resolve('./out')));
 // Initialize Supabase Admin Client for backend operations
 const supabaseUrl = process.env.VITE_SUPABASE_URL || '';
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
-const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey);
+const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, { realtime: { transport: ws } });
 
 // Helper function to upload dynamic media to Supabase
 const uploadFileToCloud = async (localPath: string, filename: string): Promise<string> => {
