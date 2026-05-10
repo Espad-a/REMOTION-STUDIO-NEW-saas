@@ -26,6 +26,7 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 app.use(express.static(path.resolve('./public')));
+app.use(express.static(path.resolve('./dist')));
 app.use('/out', express.static(path.resolve('./out')));
 
 // Initialize Supabase Admin Client for backend operations
@@ -1484,3 +1485,6 @@ app.post('/api/test-webhook', async (req, res) => {
 
 
 app.listen(port, () => console.log(`Server running at http://localhost:3001`));
+app.get('/*splat', (req, res) => {
+  res.sendFile(path.resolve('./dist/index.html'));
+});
